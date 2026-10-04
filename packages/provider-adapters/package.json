@@ -1,0 +1,1 @@
+{"name":"@finance-tools/provider-adapters","version":"0.1.0","private":true,"type":"module","exports":"./src/index.ts","dependencies":{"@finance-tools/portfolio-domain":"workspace:*"},"devDependencies":{"happy-dom":"^20.0.0"},"scripts":{"typecheck":"tsc --noEmit -p tsconfig.json","test":"vitest run"}}
