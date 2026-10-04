@@ -68,13 +68,13 @@ The body bound is the shared `MAX_REQUEST_BODY_BYTES` (1.5 MiB), allowing an
 exactly 1 MiB decoded ciphertext plus base64url and JSON overhead. An envelope
 one decoded byte over the shared `MAX_DOCUMENT_BYTES` is rejected with 413.
 
-* `/session/exchange` is **browser-only**, with exact `APP_ORIGIN` and
+- `/session/exchange` is **browser-only**, with exact `APP_ORIGIN` and
   `X-Finance-CSRF: 1`. No Clerk token can directly establish a userscript session.
-* Added **POST `/pairing/inspect`** (browser access + CSRF), body
+- Added **POST `/pairing/inspect`** (browser access + CSRF), body
   `{pairingId, code}`. Returns `{pairingId, client, approved}`; the UI must display
   the immutable stored name/scopes before approval. Codes never go in query
   strings. Approval binds the exact stored scopes, never client-supplied new ones.
-* **POST `/session/refresh` requires UUID `X-Finance-Refresh-Id`** in addition to
+- **POST `/session/refresh` requires UUID `X-Finance-Refresh-Id`** in addition to
   the contract's unchanged JSON body. Serialize refresh across tabs/GM instances,
   save the request ID before sending, and retain it with the predecessor token
   until success. A same-ID retry within 120 seconds recovers the same successor
@@ -85,11 +85,11 @@ one decoded byte over the shared `MAX_DOCUMENT_BYTES` is rejected with 413.
   Browser refresh tokens are exclusively HttpOnly cookies; script refresh tokens
   are exclusively explicit JSON. Script requests containing any Cookie header
   are rejected. Cookie credentials never bypass Origin/CSRF through `client.kind`.
-* Pairing proof redemption is atomic. The same valid secret can recover the same
+- Pairing proof redemption is atomic. The same valid secret can recover the same
   initial credentials for 120 seconds after redeem, only while its session is
   active and the initial refresh token is still current. It never creates a second
   session. After rotation/recovery timeout it returns 410.
-* Global admission limits cap **all outstanding pairing records at 1,000** and
+- Global admission limits cap **all outstanding pairing records at 1,000** and
   **rate-limit bucket rows at 10,000**, using atomic D1 counter triggers. Capacity
   rejection is 429 `admission_capacity`; concurrent unique IPs cannot exceed the
   cap. Existing rate buckets can still increment/reject at capacity. Rate calls
@@ -98,26 +98,26 @@ one decoded byte over the shared `MAX_DOCUMENT_BYTES` is rejected with 413.
   evicted to make room. The caps are operator-controlled in `admission_limits`,
   not client-writable. Pairings include approved/redeemed records until their
   expiry, making this a conservative admission limit.
-* `/sessions`, session deletion, logout-all and export require browser sessions;
+- `/sessions`, session deletion, logout-all and export require browser sessions;
   userscripts cannot administer other clients. `/me` uses persisted scopes, not
   client-provided JWT scope claims. At most 100 active sessions per account.
-* Browser exchange requires both `portfolio` and `bank-subcaps` product grants;
+- Browser exchange requires both `portfolio` and `bank-subcaps` product grants;
   pairing requires exactly one. PUT requires `product`, and each document's product
   is immutable across edits and deletion tombstones. Reads, CAS, replay, delete,
   list and export check persisted grants in addition to namespace scope. List
   accepts optional `?product=portfolio|bank-subcaps`; its cursor binds the effective
   product filter, account and namespace. Old sessions without products fail closed.
-* Vault rewrap at the same keyVersion is supported. **Changing an established
+- Vault rewrap at the same keyVersion is supported. **Changing an established
   keyVersion returns 409**: a safe whole-vault rekey/re-encryption protocol is
   not part of these contracts, and accepting arbitrary increments would strand
   all existing ciphertext. Envelope versions must match the vault exactly.
-* Free quota is 10,000 live documents plus **64 MiB stored envelope JSON across
+- Free quota is 10,000 live documents plus **64 MiB stored envelope JSON across
   committed, reserved and not-yet-cleaned abandoned versions**. Old immutable settings versions retained
   for perpetual mutation replay consume quota too. History versions are removed
   at their own three-calendar-month cutoff, even if overwritten/deleted earlier.
   No hidden unlimited version-history allowance. Export is streamed encrypted
   JSON; concurrent edits may appear in later pages (not a snapshot).
-* An independent **16 MiB logical metadata budget and 50,000 receipt limit**
+- An independent **16 MiB logical metadata budget and 50,000 receipt limit**
   cap permanent vault responses, mutation receipts, revision tombstones and blob
   registry rows. Atomic triggers account for UTF-8 vault/receipt response sizes
   plus conservative row/index allowances (512 bytes/document, blob or receipt,
@@ -127,11 +127,11 @@ one decoded byte over the shared `MAX_DOCUMENT_BYTES` is rejected with 413.
   Identical replay remains available at the cap, without allocating a new receipt.
   Expired history receipts retain their charged identity/hash but release response
   bytes when scrubbed; account cleanup releases records in bounded batches.
-* List responses have a **2 MiB page budget**, using registered blob byte sizes
+- List responses have a **2 MiB page budget**, using registered blob byte sizes
   plus response metadata allowance before fetching ciphertext. Even `limit=100`
   can return fewer documents, with a cursor after the last included ID; no large
   documents are skipped. At most one bounded envelope is buffered during export.
-* Account deletion immediately leaves a permanent disabled subject tombstone,
+- Account deletion immediately leaves a permanent disabled subject tombstone,
   immediately invalidates all sessions through the account's disabled-state check,
   clears the vault and schedules durable cleanup. It does not scan/write every
   session as part of revocation. A retry with

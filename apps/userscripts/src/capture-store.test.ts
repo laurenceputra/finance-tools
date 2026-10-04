@@ -1,4 +1,22 @@
 import { expect, it } from 'vitest';
 import { CaptureStore } from './capture-store';
-it('preserves 501+ loaded documents and unsynced edits across pulls', () => { const store = new CaptureStore<{ id: string; value: number }>(); const dirty = { id: 'dirty', value: 2 }; store.add([dirty]); store.add(Array.from({ length: 501 }, (_, index) => ({ id: String(index), value: index })), false); store.add([{ id: 'dirty', value: 1 }], false); expect(store.values).toHaveLength(502); expect(store.dirty).toEqual([dirty]); store.synced(dirty); expect(store.dirty).toEqual([]); });
-it('rejects an over-limit batch atomically without evicting dirty data', () => { const store = new CaptureStore<{ id: string }>(2); store.add([{ id: 'dirty' }]); expect(() => store.add([{ id: 'a' }, { id: 'b' }], false)).toThrow('nothing was evicted'); expect(store.values).toEqual([{ id: 'dirty' }]); });
+it('preserves 501+ loaded documents and unsynced edits across pulls', () => {
+  const store = new CaptureStore<{ id: string; value: number }>();
+  const dirty = { id: 'dirty', value: 2 };
+  store.add([dirty]);
+  store.add(
+    Array.from({ length: 501 }, (_, index) => ({ id: String(index), value: index })),
+    false,
+  );
+  store.add([{ id: 'dirty', value: 1 }], false);
+  expect(store.values).toHaveLength(502);
+  expect(store.dirty).toEqual([dirty]);
+  store.synced(dirty);
+  expect(store.dirty).toEqual([]);
+});
+it('rejects an over-limit batch atomically without evicting dirty data', () => {
+  const store = new CaptureStore<{ id: string }>(2);
+  store.add([{ id: 'dirty' }]);
+  expect(() => store.add([{ id: 'a' }, { id: 'b' }], false)).toThrow('nothing was evicted');
+  expect(store.values).toEqual([{ id: 'dirty' }]);
+});
