@@ -1,1 +1,15 @@
-{ "name": "@finance-tools/crypto", "version": "0.1.0", "private": true, "type": "module", "exports": { ".": "./src/index.ts" }, "scripts": { "typecheck": "tsc -p tsconfig.json" }, "dependencies": { "@finance-tools/contracts": "workspace:*" } }
+{
+  "name": "@finance-tools/crypto",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@finance-tools/contracts": "workspace:*"
+  }
+}

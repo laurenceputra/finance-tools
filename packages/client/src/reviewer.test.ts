@@ -4,78 +4,502 @@ import { FinanceClient } from './index';
 import type { Storage, Transport } from './index';
 import type { ExportResponse, StoredDocument, VaultResponse } from '@finance-tools/contracts';
 import { snapshotFixture } from './fixtures';
-const memory = (): Storage & { values: Map<string, unknown> } => { const values = new Map<string, unknown>(); return { values, async get<T>(key: string) { return values.get(key) as T | undefined; }, async set(key, value) { values.set(key, value); }, async delete(key) { values.delete(key); }, async keys() { return [...values.keys()]; } }; };
-const token = (accountId: string, sid = 'sid') => `e30.${btoa(JSON.stringify({ sub: accountId, sid })).replace(/=/g, '')}.signature`;
-const tokens = { accessToken: token('account'), sessionId: 'sid', expiresIn: 900, refreshToken: 'rotated' };
-const me = { accountId: 'account', namespaces: ['settings', 'history'], products: ['portfolio', 'bank-subcaps'] };
-function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(yes => { resolve = yes; }); return { promise, resolve }; }
+const memory = (): Storage & { values: Map<string, unknown> } => {
+  const values = new Map<string, unknown>();
+  return {
+    values,
+    async get<T>(key: string) {
+      return values.get(key) as T | undefined;
+    },
+    async set(key, value) {
+      values.set(key, value);
+    },
+    async delete(key) {
+      values.delete(key);
+    },
+    async keys() {
+      return [...values.keys()];
+    },
+  };
+};
+const token = (accountId: string, sid = 'sid') =>
+  `e30.${btoa(JSON.stringify({ sub: accountId, sid })).replace(/=/g, '')}.signature`;
+const tokens = {
+  accessToken: token('account'),
+  sessionId: 'sid',
+  expiresIn: 900,
+  refreshToken: 'rotated',
+};
+const me = {
+  accountId: 'account',
+  namespaces: ['settings', 'history'],
+  products: ['portfolio', 'bank-subcaps'],
+};
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((yes) => {
+    resolve = yes;
+  });
+  return { promise, resolve };
+}
 describe('reviewer regression guards', () => {
-  it('physically purges expired queued history without deleting configuration', async () => { const storage = memory(); await storage.set('mutation:account:history:expired', { body: { occurredAt: '2020-01-01T00:00:00Z' } }); await storage.set('mutation:account:settings:current', { body: { encrypted: 'configuration' } }); await storage.set('mutation:account:history:recent', { body: { occurredAt: new Date().toISOString() } }); const client = new FinanceClient(async () => ({ status: 200, body: {} }), storage, 'browser'); await client.purgeLocalHistory(); expect(await storage.get('mutation:account:history:expired')).toBeUndefined(); expect(await storage.get('mutation:account:settings:current')).toBeDefined(); expect(await storage.get('mutation:account:history:recent')).toBeDefined(); });
+  it('physically purges expired queued history without deleting configuration', async () => {
+    const storage = memory();
+    await storage.set('mutation:account:history:expired', {
+      body: { occurredAt: '2020-01-01T00:00:00Z' },
+    });
+    await storage.set('mutation:account:settings:current', {
+      body: { encrypted: 'configuration' },
+    });
+    await storage.set('mutation:account:history:recent', {
+      body: { occurredAt: new Date().toISOString() },
+    });
+    const client = new FinanceClient(async () => ({ status: 200, body: {} }), storage, 'browser');
+    await client.purgeLocalHistory();
+    expect(await storage.get('mutation:account:history:expired')).toBeUndefined();
+    expect(await storage.get('mutation:account:settings:current')).toBeDefined();
+    expect(await storage.get('mutation:account:history:recent')).toBeDefined();
+  });
   it('persists a refresh UUID before send and reuses it after response loss without clearing keys', async () => {
-    const storage = memory(); await storage.set('refresh', 'old'); await storage.set('remembered', { private: 'key' }); let failed = false; const ids: string[] = [];
+    const storage = memory();
+    await storage.set('refresh', 'old');
+    await storage.set('remembered', { private: 'key' });
+    let failed = false;
+    const ids: string[] = [];
     const transport: Transport = async (path, _method, _body, _token, headers) => {
-      if (path === '/session/refresh') { const id = headers?.['X-Finance-Refresh-Id']; expect(id).toMatch(/^[0-9a-f-]{36}$/); expect((await storage.get<{ id: string }>('refresh-attempt'))?.id).toBe(id); ids.push(id!); if (!failed) { failed = true; throw new Error('response lost'); } return { status: 200, body: tokens }; }
+      if (path === '/session/refresh') {
+        const id = headers?.['X-Finance-Refresh-Id'];
+        expect(id).toMatch(/^[0-9a-f-]{36}$/);
+        expect((await storage.get<{ id: string }>('refresh-attempt'))?.id).toBe(id);
+        ids.push(id!);
+        if (!failed) {
+          failed = true;
+          throw new Error('response lost');
+        }
+        return { status: 200, body: tokens };
+      }
       return { status: 200, body: {} };
     };
-    const client = new FinanceClient(transport, storage, 'userscript'); await expect(client.refresh()).rejects.toThrow('lost'); expect(await storage.get('refresh')).toBe('old'); expect(await storage.get('remembered')).toEqual({ private: 'key' }); await client.refresh(); expect(ids[0]).toBe(ids[1]); expect(await storage.get('refresh')).toBe('rotated'); expect(await storage.get('refresh-attempt')).toBeUndefined();
+    const client = new FinanceClient(transport, storage, 'userscript');
+    await expect(client.refresh()).rejects.toThrow('lost');
+    expect(await storage.get('refresh')).toBe('old');
+    expect(await storage.get('remembered')).toEqual({ private: 'key' });
+    await client.refresh();
+    expect(ids[0]).toBe(ids[1]);
+    expect(await storage.get('refresh')).toBe('rotated');
+    expect(await storage.get('refresh-attempt')).toBeUndefined();
   });
-  it.each([409, 429, 500, 503])('retains credentials and remembered keys after transient %s', async status => {
-    const storage = memory(); await storage.set('refresh', 'old'); await storage.set('remembered', 'private'); const client = new FinanceClient(async () => ({ status, body: { error: { code: 'retry' } } }), storage, 'userscript');
-    await expect(client.refresh()).rejects.toThrow(); expect(await storage.get('refresh')).toBe('old'); expect(await storage.get('remembered')).toBe('private'); expect(await storage.get('refresh-attempt')).toBeDefined();
-  });
+  it.each([409, 429, 500, 503])(
+    'retains credentials and remembered keys after transient %s',
+    async (status) => {
+      const storage = memory();
+      await storage.set('refresh', 'old');
+      await storage.set('remembered', 'private');
+      const client = new FinanceClient(
+        async () => ({ status, body: { error: { code: 'retry' } } }),
+        storage,
+        'userscript',
+      );
+      await expect(client.refresh()).rejects.toThrow();
+      expect(await storage.get('refresh')).toBe('old');
+      expect(await storage.get('remembered')).toBe('private');
+      expect(await storage.get('refresh-attempt')).toBeDefined();
+    },
+  );
   it('fences a late refresh response after lease expiry without overwriting another owner', async () => {
-    const storage = memory(); await storage.set('refresh', 'old'); let owned = true;
-    const client = new FinanceClient(async () => { await storage.set('refresh', 'another-owner'); owned = false; return { status: 200, body: tokens }; }, storage, 'userscript', task => task(() => { if (!owned) throw new Error('lease lost'); }));
-    await expect(client.refresh()).rejects.toThrow('lease lost'); expect(await storage.get('refresh')).toBe('another-owner');
+    const storage = memory();
+    await storage.set('refresh', 'old');
+    let owned = true;
+    const client = new FinanceClient(
+      async () => {
+        await storage.set('refresh', 'another-owner');
+        owned = false;
+        return { status: 200, body: tokens };
+      },
+      storage,
+      'userscript',
+      (task) =>
+        task(() => {
+          if (!owned) throw new Error('lease lost');
+        }),
+    );
+    await expect(client.refresh()).rejects.toThrow('lease lost');
+    expect(await storage.get('refresh')).toBe('another-owner');
   });
-  it('a stale lease holder cannot clear the new owner credentials on a late 401', async () => { const storage = memory(); await storage.set('refresh', 'old'); let owned = true; const client = new FinanceClient(async () => { await storage.set('refresh', 'new-owner'); await storage.set('remembered', 'new-key'); owned = false; return { status: 401, body: { error: { code: 'revoked' } } }; }, storage, 'userscript', task => task(() => { if (!owned) throw new Error('lease lost'); })); await expect(client.refresh()).rejects.toThrow('lease lost'); expect(await storage.get('refresh')).toBe('new-owner'); expect(await storage.get('remembered')).toBe('new-key'); });
+  it('a stale lease holder cannot clear the new owner credentials on a late 401', async () => {
+    const storage = memory();
+    await storage.set('refresh', 'old');
+    let owned = true;
+    const client = new FinanceClient(
+      async () => {
+        await storage.set('refresh', 'new-owner');
+        await storage.set('remembered', 'new-key');
+        owned = false;
+        return { status: 401, body: { error: { code: 'revoked' } } };
+      },
+      storage,
+      'userscript',
+      (task) =>
+        task(() => {
+          if (!owned) throw new Error('lease lost');
+        }),
+    );
+    await expect(client.refresh()).rejects.toThrow('lease lost');
+    expect(await storage.get('refresh')).toBe('new-owner');
+    expect(await storage.get('remembered')).toBe('new-key');
+  });
   it('does not assign late initialize results after disconnect', async () => {
-    const storage = memory(); await storage.set('refresh', 'old'); const response = deferred<{ status: number; body: unknown }>(), started = deferred<void>();
-    const client = new FinanceClient(async path => { if (path === '/session/refresh') return { status: 200, body: tokens }; if (path === '/me') { started.resolve(); return response.promise; } return { status: 204, body: undefined }; }, storage, 'userscript');
-    const initialization = client.initialize(); await started.promise; await client.disconnect(); response.resolve({ status: 200, body: me }); await expect(initialization).rejects.toThrow('cancelled'); expect(client.me).toBeUndefined(); expect(client.vault).toBeUndefined(); expect(client.unlocked).toBe(false);
+    const storage = memory();
+    await storage.set('refresh', 'old');
+    const response = deferred<{ status: number; body: unknown }>(),
+      started = deferred<void>();
+    const client = new FinanceClient(
+      async (path) => {
+        if (path === '/session/refresh') return { status: 200, body: tokens };
+        if (path === '/me') {
+          started.resolve();
+          return response.promise;
+        }
+        return { status: 204, body: undefined };
+      },
+      storage,
+      'userscript',
+    );
+    const initialization = client.initialize();
+    await started.promise;
+    await client.disconnect();
+    response.resolve({ status: 200, body: me });
+    await expect(initialization).rejects.toThrow('cancelled');
+    expect(client.me).toBeUndefined();
+    expect(client.vault).toBeUndefined();
+    expect(client.unlocked).toBe(false);
   });
   it('does not accept pairing credentials after disconnect', async () => {
-    const storage = memory(), response = deferred<{ status: number; body: unknown }>(), started = deferred<void>();
-    const client = new FinanceClient(async path => { if (path === '/pairing/redeem') { started.resolve(); return response.promise; } return { status: 204, body: undefined }; }, storage, 'userscript');
-    const redemption = client.redeem('pairing', 'secret'); await started.promise; await client.disconnect(); response.resolve({ status: 200, body: tokens }); await expect(redemption).rejects.toThrow('cancelled'); expect(await storage.get('refresh')).toBeUndefined();
+    const storage = memory(),
+      response = deferred<{ status: number; body: unknown }>(),
+      started = deferred<void>();
+    const client = new FinanceClient(
+      async (path) => {
+        if (path === '/pairing/redeem') {
+          started.resolve();
+          return response.promise;
+        }
+        return { status: 204, body: undefined };
+      },
+      storage,
+      'userscript',
+    );
+    const redemption = client.redeem('pairing', 'secret');
+    await started.promise;
+    await client.disconnect();
+    response.resolve({ status: 200, body: tokens });
+    await expect(redemption).rejects.toThrow('cancelled');
+    expect(await storage.get('refresh')).toBeUndefined();
   });
-  it('never retries an old-account encrypted put with a new-account refresh JWT', async () => { const storage = memory(), prepared = await createVault('account', 'passphrase-a'); await storage.set('refresh', 'old-family'); let refreshes = 0, puts = 0; const signals: (boolean | undefined)[] = []; const client = new FinanceClient(async (path, method) => { if (path === '/session/refresh') { refreshes++; if (refreshes === 1) return { status: 200, body: tokens }; await storage.set('remembered', { accountId: 'other', keyVersion: 1, recoverySecret: 'new-owner-key' }); return { status: 200, body: { ...tokens, accessToken: token('other', 'new-sid'), sessionId: 'new-sid', refreshToken: 'new-family' } }; } if (path === '/vault') return { status: 200, body: { revision: 1, vault: prepared.vault } }; if (path.includes('/documents/') && method === 'PUT') { puts++; return { status: 401, body: { error: { code: 'expired' } } }; } return { status: 200, body: {} }; }, storage, 'userscript'); client.me = me as unknown as typeof client.me; client.onLock = propagate => signals.push(propagate); await client.unlock('passphrase-a'); const now = new Date().toISOString(); await expect(client.put('history', 'snapshot', snapshotFixture(now), 0, now)).rejects.toThrow('account changed'); expect(puts).toBe(1); expect(client.me).toBeUndefined(); expect(client.unlocked).toBe(false); expect(await storage.get('refresh')).toBe('new-family'); expect((await storage.get<{ accountId: string }>('remembered'))?.accountId).toBe('other'); expect(signals).toContain(false); });
+  it('never retries an old-account encrypted put with a new-account refresh JWT', async () => {
+    const storage = memory(),
+      prepared = await createVault('account', 'passphrase-a');
+    await storage.set('refresh', 'old-family');
+    let refreshes = 0,
+      puts = 0;
+    const signals: (boolean | undefined)[] = [];
+    const client = new FinanceClient(
+      async (path, method) => {
+        if (path === '/session/refresh') {
+          refreshes++;
+          if (refreshes === 1) return { status: 200, body: tokens };
+          await storage.set('remembered', {
+            accountId: 'other',
+            keyVersion: 1,
+            recoverySecret: 'new-owner-key',
+          });
+          return {
+            status: 200,
+            body: {
+              ...tokens,
+              accessToken: token('other', 'new-sid'),
+              sessionId: 'new-sid',
+              refreshToken: 'new-family',
+            },
+          };
+        }
+        if (path === '/vault') return { status: 200, body: { revision: 1, vault: prepared.vault } };
+        if (path.includes('/documents/') && method === 'PUT') {
+          puts++;
+          return { status: 401, body: { error: { code: 'expired' } } };
+        }
+        return { status: 200, body: {} };
+      },
+      storage,
+      'userscript',
+    );
+    client.me = me as unknown as typeof client.me;
+    client.onLock = (propagate) => signals.push(propagate);
+    await client.unlock('passphrase-a');
+    const now = new Date().toISOString();
+    await expect(client.put('history', 'snapshot', snapshotFixture(now), 0, now)).rejects.toThrow(
+      'account changed',
+    );
+    expect(puts).toBe(1);
+    expect(client.me).toBeUndefined();
+    expect(client.unlocked).toBe(false);
+    expect(await storage.get('refresh')).toBe('new-family');
+    expect((await storage.get<{ accountId: string }>('remembered'))?.accountId).toBe('other');
+    expect(signals).toContain(false);
+  });
   it('prepared vaults cannot cross a lock epoch or account', async () => {
-    const client = new FinanceClient(async () => { throw new Error('no mutation expected'); }, memory(), 'browser'); client.me = me as unknown as typeof client.me;
-    const prepared = await client.prepareVault('long-test-passphrase'); await client.lock(); await expect(client.finishVault(prepared)).rejects.toThrow('different account or lock epoch');
-    client.me = { ...me, accountId: 'other' } as unknown as typeof client.me; await expect(client.finishVault(prepared)).rejects.toThrow('different account or lock epoch');
+    const client = new FinanceClient(
+      async () => {
+        throw new Error('no mutation expected');
+      },
+      memory(),
+      'browser',
+    );
+    client.me = me as unknown as typeof client.me;
+    const prepared = await client.prepareVault('long-test-passphrase');
+    await client.lock();
+    await expect(client.finishVault(prepared)).rejects.toThrow('different account or lock epoch');
+    client.me = { ...me, accountId: 'other' } as unknown as typeof client.me;
+    await expect(client.finishVault(prepared)).rejects.toThrow('different account or lock epoch');
   });
   it('a put paused at storage cannot encrypt or send under a newly selected account', async () => {
-    const storage = memory(), waiting = deferred<undefined>(), started = deferred<void>(); let paused = false, writes = 0;
-    const originalGet = storage.get.bind(storage); storage.get = async <T>(key: string) => { if (paused && key.includes(':history:')) { started.resolve(); return await waiting.promise as T | undefined; } return originalGet<T>(key); };
-    const client = new FinanceClient(async (path, _method, body) => { if (path === '/session/refresh') return { status: 200, body: tokens }; if (path === '/vault') return { status: 200, body: { revision: 1, vault: (body as { vault: unknown }).vault } }; writes++; return { status: 200, body: {} }; }, storage, 'browser'); client.me = me as unknown as typeof client.me;
-    const prepared = await client.prepareVault('long-test-passphrase'); await client.finishVault(prepared); paused = true;
-    const now = new Date().toISOString(); const put = client.put('history', 'snapshot', snapshotFixture(now), 0, now); await started.promise; await client.lock(); client.me = { ...me, accountId: 'other' } as unknown as typeof client.me; waiting.resolve(undefined);
-    await expect(put).rejects.toThrow('cancelled'); expect(writes).toBe(0);
+    const storage = memory(),
+      waiting = deferred<undefined>(),
+      started = deferred<void>();
+    let paused = false,
+      writes = 0;
+    const originalGet = storage.get.bind(storage);
+    storage.get = async <T>(key: string) => {
+      if (paused && key.includes(':history:')) {
+        started.resolve();
+        return (await waiting.promise) as T | undefined;
+      }
+      return originalGet<T>(key);
+    };
+    const client = new FinanceClient(
+      async (path, _method, body) => {
+        if (path === '/session/refresh') return { status: 200, body: tokens };
+        if (path === '/vault')
+          return { status: 200, body: { revision: 1, vault: (body as { vault: unknown }).vault } };
+        writes++;
+        return { status: 200, body: {} };
+      },
+      storage,
+      'browser',
+    );
+    client.me = me as unknown as typeof client.me;
+    const prepared = await client.prepareVault('long-test-passphrase');
+    await client.finishVault(prepared);
+    paused = true;
+    const now = new Date().toISOString();
+    const put = client.put('history', 'snapshot', snapshotFixture(now), 0, now);
+    await started.promise;
+    await client.lock();
+    client.me = { ...me, accountId: 'other' } as unknown as typeof client.me;
+    waiting.resolve(undefined);
+    await expect(put).rejects.toThrow('cancelled');
+    expect(writes).toBe(0);
   });
-  it('clears old remembered keys and views when the vault key version changes', async () => { const storage = memory(); let replacement: VaultResponse | undefined; const client = new FinanceClient(async (path, method, body) => { if (path === '/session/refresh') return { status: 200, body: tokens }; return { status: 200, body: method === 'GET' ? replacement : { revision: 1, vault: (body as { vault: unknown }).vault } }; }, storage, 'browser'); client.me = me as unknown as typeof client.me; const prepared = await client.prepareVault('long-test-passphrase'); await client.finishVault(prepared); await storage.set('remembered', { accountId: 'account', keyVersion: 1, key: prepared.vaultKey }); replacement = { revision: 2, vault: { ...prepared.vault, keyVersion: 2, passphraseEnvelope: { ...prepared.vault.passphraseEnvelope, keyVersion: 2 }, recoveryEnvelope: { ...prepared.vault.recoveryEnvelope, keyVersion: 2 } } }; await expect(client.loadVault()).rejects.toThrow('key version changed'); expect(client.unlocked).toBe(false); expect(client.vault?.vault.keyVersion).toBe(2); expect(await storage.get('remembered')).toBeUndefined(); });
-  it('preserves separate mutation receipts when concurrent edits to one document both lose responses', async () => { const storage = memory(); let lose = true; const bodies: { mutationId: string; product: 'portfolio'; envelope: StoredDocument['envelope'] }[] = []; const client = new FinanceClient(async (path, _method, body) => { if (path === '/session/refresh') return { status: 200, body: tokens }; if (path === '/vault') return { status: 200, body: { revision: 1, vault: (body as { vault: unknown }).vault } }; const request = body as typeof bodies[number]; bodies.push(request); if (lose) throw new Error('response lost'); return { status: 200, body: { id: 'current', namespace: 'settings', revision: 1, updatedAt: new Date().toISOString(), product: request.product, envelope: request.envelope } }; }, storage, 'browser'); client.me = me as unknown as typeof client.me; await client.finishVault(await client.prepareVault('long-test-passphrase')); await Promise.allSettled([client.put('settings', 'current', { a: 1 }, 0), client.put('settings', 'current', { b: 2 }, 0)]); expect(bodies).toHaveLength(2); lose = false; await client.put('settings', 'current', { a: 1 }, 0); await client.put('settings', 'current', { b: 2 }, 0); expect(bodies[2].mutationId).toBe(bodies[0].mutationId); expect(bodies[3].mutationId).toBe(bodies[1].mutationId); });
+  it('clears old remembered keys and views when the vault key version changes', async () => {
+    const storage = memory();
+    let replacement: VaultResponse | undefined;
+    const client = new FinanceClient(
+      async (path, method, body) => {
+        if (path === '/session/refresh') return { status: 200, body: tokens };
+        return {
+          status: 200,
+          body:
+            method === 'GET'
+              ? replacement
+              : { revision: 1, vault: (body as { vault: unknown }).vault },
+        };
+      },
+      storage,
+      'browser',
+    );
+    client.me = me as unknown as typeof client.me;
+    const prepared = await client.prepareVault('long-test-passphrase');
+    await client.finishVault(prepared);
+    await storage.set('remembered', {
+      accountId: 'account',
+      keyVersion: 1,
+      key: prepared.vaultKey,
+    });
+    replacement = {
+      revision: 2,
+      vault: {
+        ...prepared.vault,
+        keyVersion: 2,
+        passphraseEnvelope: { ...prepared.vault.passphraseEnvelope, keyVersion: 2 },
+        recoveryEnvelope: { ...prepared.vault.recoveryEnvelope, keyVersion: 2 },
+      },
+    };
+    await expect(client.loadVault()).rejects.toThrow('key version changed');
+    expect(client.unlocked).toBe(false);
+    expect(client.vault?.vault.keyVersion).toBe(2);
+    expect(await storage.get('remembered')).toBeUndefined();
+  });
+  it('preserves separate mutation receipts when concurrent edits to one document both lose responses', async () => {
+    const storage = memory();
+    let lose = true;
+    const bodies: {
+      mutationId: string;
+      product: 'portfolio';
+      envelope: StoredDocument['envelope'];
+    }[] = [];
+    const client = new FinanceClient(
+      async (path, _method, body) => {
+        if (path === '/session/refresh') return { status: 200, body: tokens };
+        if (path === '/vault')
+          return { status: 200, body: { revision: 1, vault: (body as { vault: unknown }).vault } };
+        const request = body as (typeof bodies)[number];
+        bodies.push(request);
+        if (lose) throw new Error('response lost');
+        return {
+          status: 200,
+          body: {
+            id: 'current',
+            namespace: 'settings',
+            revision: 1,
+            updatedAt: new Date().toISOString(),
+            product: request.product,
+            envelope: request.envelope,
+          },
+        };
+      },
+      storage,
+      'browser',
+    );
+    client.me = me as unknown as typeof client.me;
+    await client.finishVault(await client.prepareVault('long-test-passphrase'));
+    await Promise.allSettled([
+      client.put('settings', 'current', { a: 1 }, 0),
+      client.put('settings', 'current', { b: 2 }, 0),
+    ]);
+    expect(bodies).toHaveLength(2);
+    lose = false;
+    await client.put('settings', 'current', { a: 1 }, 0);
+    await client.put('settings', 'current', { b: 2 }, 0);
+    expect(bodies[2].mutationId).toBe(bodies[0].mutationId);
+    expect(bodies[3].mutationId).toBe(bodies[1].mutationId);
+  });
   it('exports only granted namespaces', async () => {
-    const paths: string[] = []; const client = new FinanceClient(async path => { paths.push(path); if (path === '/session/refresh') return { status: 200, body: tokens }; return { status: 200, body: { documents: [], cursor: null } }; }, memory(), 'browser'); client.me = { ...me, namespaces: ['history'] } as unknown as typeof client.me;
-    const result = await client.decryptedExport(); expect(result.documents).toEqual([]); expect(paths.some(path => path.includes('/settings'))).toBe(false);
+    const paths: string[] = [];
+    const client = new FinanceClient(
+      async (path) => {
+        paths.push(path);
+        if (path === '/session/refresh') return { status: 200, body: tokens };
+        return { status: 200, body: { documents: [], cursor: null } };
+      },
+      memory(),
+      'browser',
+    );
+    client.me = { ...me, namespaces: ['history'] } as unknown as typeof client.me;
+    const result = await client.decryptedExport();
+    expect(result.documents).toEqual([]);
+    expect(paths.some((path) => path.includes('/settings'))).toBe(false);
   });
-  it('renews deliberately for revoke-all without minting another Clerk session', async () => { const storage = memory(); let refreshes = 0, exchanges = 0; const latest = `e30.${btoa(JSON.stringify({ sub: 'account', sid: 'sid', jti: 'latest' })).replace(/=/g, '')}.signature`; const client = new FinanceClient(async (path, _method, _body, bearer) => { if (path === '/session/exchange') exchanges++; if (path === '/session/refresh') return { status: 200, body: { ...tokens, accessToken: ++refreshes === 1 ? tokens.accessToken : latest } }; expect(path).toBe('/session/logout-all'); expect(bearer).toBe(latest); return { status: 204, body: undefined }; }, storage, 'browser'); client.me = me as unknown as typeof client.me; await client.refresh(); await client.disconnect(true); expect(refreshes).toBe(2); expect(exchanges).toBe(0); expect(client.me).toBeUndefined(); expect(await storage.get('refresh-attempt')).toBeUndefined(); });
+  it('renews deliberately for revoke-all without minting another Clerk session', async () => {
+    const storage = memory();
+    let refreshes = 0,
+      exchanges = 0;
+    const latest = `e30.${btoa(JSON.stringify({ sub: 'account', sid: 'sid', jti: 'latest' })).replace(/=/g, '')}.signature`;
+    const client = new FinanceClient(
+      async (path, _method, _body, bearer) => {
+        if (path === '/session/exchange') exchanges++;
+        if (path === '/session/refresh')
+          return {
+            status: 200,
+            body: { ...tokens, accessToken: ++refreshes === 1 ? tokens.accessToken : latest },
+          };
+        expect(path).toBe('/session/logout-all');
+        expect(bearer).toBe(latest);
+        return { status: 204, body: undefined };
+      },
+      storage,
+      'browser',
+    );
+    client.me = me as unknown as typeof client.me;
+    await client.refresh();
+    await client.disconnect(true);
+    expect(refreshes).toBe(2);
+    expect(exchanges).toBe(0);
+    expect(client.me).toBeUndefined();
+    expect(await storage.get('refresh-attempt')).toBeUndefined();
+  });
   it('preflights authenticated backups and resumes an interrupted exact restore', async () => {
-    const storage = memory(), prepared = await createVault('account', 'backup-passphrase'); const now = new Date().toISOString();
-    const envelope = await encryptJson(prepared.vaultKey, snapshotFixture(now), { accountId: 'account', namespace: 'history', documentId: 'snapshot', schemaVersion: 1, keyVersion: 1 });
-    const doc: StoredDocument = { id: 'snapshot', namespace: 'history', product: 'portfolio', revision: 1, envelope, occurredAt: now, updatedAt: now };
-    const backup: ExportResponse = { version: 1, accountId: 'account', exportedAt: now, vault: { revision: 1, vault: prepared.vault }, documents: [doc] };
-    let vault: VaultResponse | undefined, fail = true, restored = false; const ids: string[] = [], writes: string[] = [];
-    const client = new FinanceClient(async (path, method, body) => {
-      if (path === '/session/refresh') return { status: 200, body: tokens };
-      if (path === '/vault' && method === 'GET') return { status: vault ? 200 : 404, body: vault ?? {} };
-      if (path.startsWith('/documents/') && method === 'GET') return { status: 200, body: { documents: restored && path.startsWith('/documents/history') ? [doc] : [], cursor: null } };
-      writes.push(path);
-      if (path === '/vault') { vault = { revision: 1, vault: (body as { vault: VaultResponse['vault'] }).vault }; return { status: 200, body: vault }; }
-      ids.push((body as { mutationId: string }).mutationId); if (fail) { fail = false; throw new Error('offline'); } restored = true; return { status: 200, body: doc };
-    }, storage, 'browser'); client.me = me as unknown as typeof client.me;
-    await expect(client.restore(backup, 'wrong-password')).rejects.toThrow(); expect(writes).toEqual([]);
-    await expect(client.restore({ ...backup, documents: [doc, doc] }, 'backup-passphrase')).rejects.toThrow('Duplicate'); expect(writes).toEqual([]);
-    await expect(client.restore(backup, 'backup-passphrase')).rejects.toThrow('offline'); await client.restore(backup, 'backup-passphrase'); expect(ids[0]).toBe(ids[1]); expect(writes.filter(x => x === '/vault')).toHaveLength(1); expect(client.unlocked).toBe(true); expect(await storage.get('restore:account')).toBeUndefined();
+    const storage = memory(),
+      prepared = await createVault('account', 'backup-passphrase');
+    const now = new Date().toISOString();
+    const envelope = await encryptJson(prepared.vaultKey, snapshotFixture(now), {
+      accountId: 'account',
+      namespace: 'history',
+      documentId: 'snapshot',
+      schemaVersion: 1,
+      keyVersion: 1,
+    });
+    const doc: StoredDocument = {
+      id: 'snapshot',
+      namespace: 'history',
+      product: 'portfolio',
+      revision: 1,
+      envelope,
+      occurredAt: now,
+      updatedAt: now,
+    };
+    const backup: ExportResponse = {
+      version: 1,
+      accountId: 'account',
+      exportedAt: now,
+      vault: { revision: 1, vault: prepared.vault },
+      documents: [doc],
+    };
+    let vault: VaultResponse | undefined,
+      fail = true,
+      restored = false;
+    const ids: string[] = [],
+      writes: string[] = [];
+    const client = new FinanceClient(
+      async (path, method, body) => {
+        if (path === '/session/refresh') return { status: 200, body: tokens };
+        if (path === '/vault' && method === 'GET')
+          return { status: vault ? 200 : 404, body: vault ?? {} };
+        if (path.startsWith('/documents/') && method === 'GET')
+          return {
+            status: 200,
+            body: {
+              documents: restored && path.startsWith('/documents/history') ? [doc] : [],
+              cursor: null,
+            },
+          };
+        writes.push(path);
+        if (path === '/vault') {
+          vault = { revision: 1, vault: (body as { vault: VaultResponse['vault'] }).vault };
+          return { status: 200, body: vault };
+        }
+        ids.push((body as { mutationId: string }).mutationId);
+        if (fail) {
+          fail = false;
+          throw new Error('offline');
+        }
+        restored = true;
+        return { status: 200, body: doc };
+      },
+      storage,
+      'browser',
+    );
+    client.me = me as unknown as typeof client.me;
+    await expect(client.restore(backup, 'wrong-password')).rejects.toThrow();
+    expect(writes).toEqual([]);
+    await expect(
+      client.restore({ ...backup, documents: [doc, doc] }, 'backup-passphrase'),
+    ).rejects.toThrow('Duplicate');
+    expect(writes).toEqual([]);
+    await expect(client.restore(backup, 'backup-passphrase')).rejects.toThrow('offline');
+    await client.restore(backup, 'backup-passphrase');
+    expect(ids[0]).toBe(ids[1]);
+    expect(writes.filter((x) => x === '/vault')).toHaveLength(1);
+    expect(client.unlocked).toBe(true);
+    expect(await storage.get('restore:account')).toBeUndefined();
   });
 });

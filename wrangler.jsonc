@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "finance-tools",
+  "account_id": "00000000000000000000000000000000",
   "main": "apps/api/src/index.ts",
   "compatibility_date": "2026-10-04",
   "compatibility_flags": ["nodejs_compat"],
@@ -9,9 +10,21 @@
   "limits": { "subrequests": 12000 },
   "triggers": { "crons": ["0 * * * *"] },
   "routes": [{ "pattern": "finance.laurenceputra.com", "custom_domain": true }],
-  "assets": { "directory": "dist", "binding": "ASSETS", "not_found_handling": "single-page-application", "run_worker_first": ["/api/*"] },
-  "d1_databases": [{ "binding": "DB", "database_name": "finance-tools", "database_id": "REPLACE_WITH_PROVISIONED_D1_ID", "migrations_dir": "apps/api/migrations" }],
+  "assets": {
+    "directory": "dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/scripts/*"],
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "finance-tools",
+      "database_id": "REPLACE_WITH_PROVISIONED_D1_ID",
+      "migrations_dir": "apps/api/migrations",
+    },
+  ],
   "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "finance-tools" }],
   "observability": { "enabled": true },
-  "vars": { "APP_ORIGIN": "https://finance.laurenceputra.com" }
+  "vars": { "APP_ORIGIN": "https://finance.laurenceputra.com" },
 }

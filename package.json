@@ -1,12 +1,27 @@
 {
-  "name": "finance-tools", "private": true, "version": "0.1.0",
+  "name": "finance-tools",
+  "private": true,
+  "version": "0.1.0",
   "packageManager": "pnpm@10.18.3",
   "scripts": {
-    "test": "vitest run", "typecheck": "corepack pnpm -r --if-present typecheck",
-    "build": "corepack pnpm --filter @finance-tools/web build && corepack pnpm --filter @finance-tools/userscripts build", "check": "corepack pnpm test && corepack pnpm typecheck && corepack pnpm build",
+    "test": "vitest run",
+    "typecheck": "corepack pnpm -r --if-present typecheck",
+    "build": "corepack pnpm --filter @finance-tools/web build && corepack pnpm --filter @finance-tools/userscripts build && node scripts/verify-artifacts.mjs",
+    "check": "corepack pnpm test && corepack pnpm typecheck && corepack pnpm build",
     "dev": "node scripts/dev.mjs",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "deploy:cloudflare": "node scripts/deploy-preflight.mjs && wrangler d1 migrations apply finance-tools --remote && wrangler deploy",
     "types:worker": "wrangler types --env-file .dev.vars.example --strict-vars=false --include-runtime=false && node scripts/worker-types.mjs"
   },
-  "devDependencies": { "@cloudflare/workers-types": "5.20261004.1", "typescript": "^5.9.3", "vitest": "^3.2.4", "wrangler": "^4.40.0", "esbuild": "^0.25.10", "@types/node": "^22.18.8" }
+  "devDependencies": {
+    "jsonc-parser": "3.3.1",
+    "prettier": "3.6.2",
+    "@cloudflare/workers-types": "5.20261004.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4",
+    "wrangler": "^4.40.0",
+    "esbuild": "^0.25.10",
+    "@types/node": "^22.18.8"
+  }
 }

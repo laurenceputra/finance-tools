@@ -1,7 +1,51 @@
 import { build } from 'esbuild';
-const alias = Object.fromEntries(['client', 'contracts', 'crypto', 'provider-adapters', 'portfolio-domain', 'card-rules'].map(name => [`@finance-tools/${name}`, new URL(`../../packages/${name}/src/index.ts`, import.meta.url).pathname]));
-const matches = { portfolio: ['https://app.sg.endowus.com/*', 'https://secure.fundsupermart.com/fsmone/*', 'https://internet.ocbc.com/internet-banking/digital/web/sg/cfo/*'], 'bank-subcaps': ['https://pib.uob.com.sg/*', 'https://cib.maybank2u.com.sg/*'] };
+const alias = Object.fromEntries(
+  ['client', 'contracts', 'crypto', 'provider-adapters', 'portfolio-domain', 'card-rules'].map(
+    (name) => [
+      `@finance-tools/${name}`,
+      new URL(`../../packages/${name}/src/index.ts`, import.meta.url).pathname,
+    ],
+  ),
+);
+const matches = {
+  portfolio: [
+    'https://app.sg.endowus.com/*',
+    'https://secure.fundsupermart.com/fsmone/*',
+    'https://internet.ocbc.com/internet-banking/digital/web/sg/cfo/*',
+  ],
+  'bank-subcaps': ['https://pib.uob.com.sg/*', 'https://cib.maybank2u.com.sg/*'],
+};
 for (const [name, hosts] of Object.entries(matches)) {
-  const metadata = ['// ==UserScript==', `// @name Finance ${name}`, '// @namespace https://finance.laurenceputra.com', '// @version 0.1.0', '// @description Private encrypted finance capture; pair and unlock explicitly.', ...hosts.map(host => `// @match ${host}`), '// @run-at document-start', '// @noframes', '// @grant GM_getValue', '// @grant GM_setValue', '// @grant GM_deleteValue', '// @grant GM_listValues', '// @grant GM_addValueChangeListener', '// @grant GM_xmlhttpRequest', '// @grant GM_registerMenuCommand', ...(name === 'portfolio' ? ['// @grant unsafeWindow'] : []), '// @connect finance.laurenceputra.com', `// @updateURL https://finance.laurenceputra.com/scripts/${name}.user.js`, `// @downloadURL https://finance.laurenceputra.com/scripts/${name}.user.js`, '// ==/UserScript=='].join('\n');
-  await build({ entryPoints: [`src/${name}.ts`], outfile: `../../dist/scripts/${name}.user.js`, bundle: true, format: 'iife', target: 'es2022', banner: { js: metadata }, legalComments: 'none', alias });
+  const metadata = [
+    '// ==UserScript==',
+    `// @name Finance ${name}`,
+    '// @namespace https://finance.laurenceputra.com',
+    '// @version 0.1.0',
+    '// @description Private encrypted finance capture; pair and unlock explicitly.',
+    ...hosts.map((host) => `// @match ${host}`),
+    '// @run-at document-start',
+    '// @noframes',
+    '// @grant GM_getValue',
+    '// @grant GM_setValue',
+    '// @grant GM_deleteValue',
+    '// @grant GM_listValues',
+    '// @grant GM_addValueChangeListener',
+    '// @grant GM_xmlhttpRequest',
+    '// @grant GM_registerMenuCommand',
+    ...(name === 'portfolio' ? ['// @grant unsafeWindow'] : []),
+    '// @connect finance.laurenceputra.com',
+    `// @updateURL https://finance.laurenceputra.com/scripts/${name}.user.js`,
+    `// @downloadURL https://finance.laurenceputra.com/scripts/${name}.user.js`,
+    '// ==/UserScript==',
+  ].join('\n');
+  await build({
+    entryPoints: [`src/${name}.ts`],
+    outfile: `../../dist/scripts/${name}.user.js`,
+    bundle: true,
+    format: 'iife',
+    target: 'es2022',
+    banner: { js: metadata },
+    legalComments: 'none',
+    alias,
+  });
 }

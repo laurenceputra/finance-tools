@@ -1,2 +1,21 @@
 import { defineConfig } from 'vite';
-export default defineConfig({ server: { port: 5173, strictPort: true, proxy: { '/api': { target: 'http://localhost:8787', changeOrigin: false } } }, resolve: { alias: { '@finance-tools/card-rules': new URL('../../packages/card-rules/src/index.ts', import.meta.url).pathname, '@finance-tools/portfolio-domain': new URL('../../packages/portfolio-domain/src/index.ts', import.meta.url).pathname } }, build: { outDir: '../../dist', emptyOutDir: true } });
+export default defineConfig({
+  server: {
+    port: 5173,
+    strictPort: true,
+    proxy: { '/api': { target: 'http://localhost:8787', changeOrigin: false } },
+  },
+  resolve: {
+    alias: {
+      '@finance-tools/card-rules': new URL(
+        '../../packages/card-rules/src/index.ts',
+        import.meta.url,
+      ).pathname,
+      '@finance-tools/portfolio-domain': new URL(
+        '../../packages/portfolio-domain/src/index.ts',
+        import.meta.url,
+      ).pathname,
+    },
+  },
+  build: { outDir: '../../dist', emptyOutDir: true },
+});

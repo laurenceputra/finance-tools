@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.wrangler/
+coverage/
+pnpm-lock.yaml
+worker-configuration.d.ts
+.dev.vars*
+.env*
