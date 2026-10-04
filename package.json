@@ -11,7 +11,7 @@
     "dev": "node scripts/dev.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "deploy:cloudflare": "node scripts/deploy-preflight.mjs && wrangler d1 migrations apply finance-tools --remote && wrangler deploy",
+    "deploy:cloudflare": "node scripts/deploy-cloudflare.mjs",
     "types:worker": "wrangler types --env-file .dev.vars.example --strict-vars=false --include-runtime=false && node scripts/worker-types.mjs"
   },
   "devDependencies": {

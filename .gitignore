@@ -6,3 +6,5 @@ dist/
 !.env.example
 !.dev.vars.example
 coverage/
+/wrangler.deploy.jsonc
+/wrangler.deploy.jsonc.tmp
