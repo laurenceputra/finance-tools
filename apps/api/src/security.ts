@@ -78,13 +78,12 @@ export async function unseal(env: Env, text: string, context: string) {
     ),
   );
 }
-const ISSUER = 'https://finance-tools.example.com';
 const AUDIENCE = 'finance-tools-api-v1';
 export async function accessToken(env: Env, session: Session) {
   const client = JSON.parse(session.client) as Client;
   return new SignJWT({ sid: session.id, scopes: client.namespaces, products: client.products })
     .setProtectedHeader({ alg: 'HS256', typ: 'JWT' })
-    .setIssuer(ISSUER)
+    .setIssuer(env.APP_ORIGIN)
     .setAudience(AUDIENCE)
     .setSubject(session.account_id)
     .setIssuedAt()
@@ -99,7 +98,7 @@ export async function authenticate(c: Ctx) {
   try {
     const { payload } = await jwtVerify(auth.slice(7), key(c.env.ACCESS_JWT_SECRET), {
       algorithms: ['HS256'],
-      issuer: ISSUER,
+      issuer: c.env.APP_ORIGIN,
       audience: AUDIENCE,
       typ: 'JWT',
       requiredClaims: ['exp', 'iat', 'sub', 'sid', 'jti'],

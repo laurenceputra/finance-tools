@@ -5,18 +5,16 @@ import {
   writeFileSync,
   rmSync,
   symlinkSync,
-  statSync,
   existsSync,
+  statSync,
+  readdirSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync, execFileSync } from 'node:child_process';
-import { afterEach, expect, it, vi } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { afterEach, expect, it } from 'vitest';
 import { parse } from 'jsonc-parser';
 
-const account = '01234567'.repeat(4);
-const database = ['01234567', '89ab', 'cdef', '0123', '456789abcdef'].join('-');
-const token = 'simulated-not-a-secret';
 const directories: string[] = [];
 function isolatedEnv(root: string) {
   return {
@@ -28,28 +26,13 @@ function isolatedEnv(root: string) {
   };
 }
 afterEach(() => {
-  vi.unstubAllEnvs();
   for (const directory of directories.splice(0))
     rmSync(directory, { recursive: true, force: true });
-});
-it('does not inherit parent authentication or Wrangler settings in fixture environments', () => {
-  for (const name of [
-    'CF_API_TOKEN',
-    'CF_API_KEY',
-    'CLOUDFLARE_API_KEY',
-    'CLOUDFLARE_API_TOKEN',
-    'WRANGLER_LOG_PATH',
-    'NODE_OPTIONS',
-  ])
-    vi.stubEnv(name, 'parent-credential-sentinel');
-  expect(Object.values(isolatedEnv('/synthetic/home'))).not.toContain('parent-credential-sentinel');
-  expect(run().status).toBe(0);
 });
 function run(
   overrides: Record<string, string> = {},
   configOverrides: Record<string, unknown> = {},
   rawConfig?: string,
-  trackedLeak?: string,
 ) {
   const root = mkdtempSync(join(tmpdir(), 'finance-preflight-'));
   directories.push(root);
@@ -59,106 +42,109 @@ function run(
     join(root, 'node_modules'),
     'dir',
   );
-  writeFileSync(
-    join(root, 'scripts/deploy-preflight.mjs'),
-    readFileSync(new URL('./deploy-preflight.mjs', import.meta.url)),
-  );
+  for (const script of ['deploy-preflight.mjs', 'deployment-config.mjs'])
+    writeFileSync(
+      join(root, 'scripts', script),
+      readFileSync(new URL(`./${script}`, import.meta.url)),
+    );
   const template = readFileSync(new URL('../wrangler.jsonc', import.meta.url), 'utf8');
-  writeFileSync(
-    join(root, 'wrangler.jsonc'),
-    rawConfig ?? JSON.stringify({ ...parse(template), ...configOverrides }),
-  );
-  const env = isolatedEnv(root);
-  execFileSync('git', ['init', '--quiet'], { cwd: root, env });
-  execFileSync('git', ['add', 'wrangler.jsonc', 'scripts'], { cwd: root, env });
-  if (trackedLeak) {
-    writeFileSync(join(root, 'leak.txt'), trackedLeak);
-    execFileSync('git', ['add', 'leak.txt'], { cwd: root, env });
-  }
-  writeFileSync(join(root, 'wrangler.deploy.jsonc'), 'stale');
+  const config = rawConfig ?? JSON.stringify({ ...parse(template), ...configOverrides });
+  writeFileSync(join(root, 'wrangler.jsonc'), config);
+  writeFileSync(join(root, 'wrangler.deploy.jsonc'), 'stale private output');
   const result = spawnSync(process.execPath, [join(root, 'scripts/deploy-preflight.mjs')], {
     encoding: 'utf8',
     env: {
-      ...env,
+      ...isolatedEnv(root),
       WORKERS_CI: '1',
       WORKERS_CI_BRANCH: 'main',
-      CLOUDFLARE_API_TOKEN: token,
-      CLOUDFLARE_ACCOUNT_ID: account,
-      CLOUDFLARE_D1_DATABASE_ID: database,
+      APP_HOSTNAME: 'finance.example.com',
+      CLOUDFLARE_D1_DATABASE_ID: '11111111-1111-4111-8111-111111111111',
       ...overrides,
     },
   });
-  expect(result.stdout + result.stderr).not.toContain(token);
-  expect(result.stdout + result.stderr).not.toContain(account);
-  expect(result.stdout + result.stderr).not.toContain(database);
-  expect(existsSync(join(root, 'wrangler.deploy.jsonc.tmp'))).toBe(false);
-  if (result.status !== 0) expect(existsSync(join(root, 'wrangler.deploy.jsonc'))).toBe(false);
+  expect(readFileSync(join(root, 'wrangler.jsonc'), 'utf8')).toBe(config);
+  expect(existsSync(join(root, 'wrangler.deploy.jsonc'))).toBe(result.status === 0);
+  expect(readdirSync(root).filter((name) => name.startsWith('.wrangler-deploy-'))).toEqual([]);
   return { ...result, root };
 }
-it('injects synthetic identifiers into the actual template without changing bindings or paths', () => {
+it('generates private root-relative configuration without custom authentication variables or git', () => {
   const result = run();
   expect(result.status, result.stderr).toBe(0);
-  const generated = JSON.parse(readFileSync(join(result.root, 'wrangler.deploy.jsonc'), 'utf8'));
-  const template = parse(readFileSync(new URL('../wrangler.jsonc', import.meta.url), 'utf8'));
-  expect(template).not.toHaveProperty('r2_buckets');
-  expect(template).not.toHaveProperty('limits.subrequests');
-  expect(template.d1_databases).toHaveLength(1);
-  expect(generated).toEqual({
-    ...template,
-    account_id: account,
-    d1_databases: template.d1_databases.map((binding: object) => ({
-      ...binding,
-      database_id: database,
-    })),
-  });
-  expect(statSync(join(result.root, 'wrangler.deploy.jsonc')).mode & 0o777).toBe(0o600);
+  expect(run({ CLOUDFLARE_API_TOKEN: '', CLOUDFLARE_ACCOUNT_ID: '' }).status).toBe(0);
+  const output = join(result.root, 'wrangler.deploy.jsonc');
+  expect(statSync(output).mode & 0o777).toBe(0o600);
+  const config = JSON.parse(readFileSync(output, 'utf8'));
+  expect(config.d1_databases[0].database_id).toBe('11111111-1111-4111-8111-111111111111');
+  expect(config.routes).toEqual([{ pattern: 'finance.example.com', custom_domain: true }]);
+  expect(config.vars.APP_ORIGIN).toBe('https://finance.example.com');
+  expect(config.main).toBe('apps/api/src/index.ts');
+  expect(config.assets.directory).toBe('dist');
+  expect(config.d1_databases[0].migrations_dir).toBe('apps/api/migrations');
 });
-it('requires main Workers Builds and rejects missing or malformed deployment variables', () => {
+it('rejects missing/invalid UUIDs and hostname protocols, ports, paths or injection without echoing values', () => {
+  for (const value of [
+    '',
+    'invalid',
+    '00000000-0000-0000-0000-000000000000',
+    '11111111-1111-4111-8111-111111111111\n',
+  ]) {
+    expect(run({ CLOUDFLARE_D1_DATABASE_ID: value }).status).not.toBe(0);
+  }
+  for (const value of [
+    '',
+    'https://finance.example.com',
+    'finance.example.com:443',
+    'finance.example.com/path',
+    'finance.example.com?x=1',
+    'finance.example.com#x',
+    'user@finance.example.com',
+    '*.example.com',
+    'finance..example.com',
+    '-finance.example.com',
+    'finance.example.com.',
+    'finance.example.com\n',
+    'finance.example.com"',
+    '127.0.0.1',
+    'finance.123',
+    'finance.0x123',
+  ]) {
+    const result = run({ APP_HOSTNAME: value });
+    expect(result.status).not.toBe(0);
+    if (value) expect(result.stderr).not.toContain(value);
+  }
+  const result = run({ APP_HOSTNAME: 'Finance.Example.COM' });
+  expect(
+    JSON.parse(readFileSync(join(result.root, 'wrangler.deploy.jsonc'), 'utf8')).vars.APP_ORIGIN,
+  ).toBe('https://finance.example.com');
+});
+it('requires main Workers Builds before deployment', () => {
   for (const overrides of [
     { WORKERS_CI: '' },
     { WORKERS_CI: 'true' },
     { WORKERS_CI_BRANCH: '' },
     { WORKERS_CI_BRANCH: 'feature' },
-    { CLOUDFLARE_API_TOKEN: '' },
-    { CLOUDFLARE_ACCOUNT_ID: '' },
-    { CLOUDFLARE_ACCOUNT_ID: 'invalid' },
-    { CLOUDFLARE_D1_DATABASE_ID: '' },
-    { CLOUDFLARE_D1_DATABASE_ID: 'invalid' },
   ])
     expect(run(overrides).status).not.toBe(0);
 });
-it('fails closed on malformed JSONC, embedded identifiers and previews', () => {
-  expect(run({}, {}, '{ "workers_dev": false, broken }').status).not.toBe(0);
+it('fails closed on malformed JSONC, missing/invalid DB UUIDs and previews', () => {
+  for (const raw of ['{ "workers_dev": false, broken }', 'null', '[]'])
+    expect(run({}, {}, raw).status).not.toBe(0);
   for (const config of [
-    { account_id: account },
     { workers_dev: true },
     { preview_urls: true },
-    { d1_databases: [{ binding: 'DB', database_id: database }] },
+    { workers_dev: undefined },
+    { preview_urls: undefined },
+    { d1_databases: null },
+    { d1_databases: {} },
+    { d1_databases: [] },
+    { d1_databases: [{ binding: 'NOT_DB' }] },
   ])
     expect(run({}, config).status).not.toBe(0);
-  expect(run({}, {}, undefined, account).status).not.toBe(0);
-  expect(run({}, {}, undefined, database).status).not.toBe(0);
 });
-it('keeps deployment configs ignored and both remote commands on the generated config', () => {
-  const root = new URL('../', import.meta.url).pathname;
-  for (const file of ['wrangler.deploy.jsonc', 'wrangler.deploy.jsonc.tmp'])
-    expect(
-      execFileSync('git', ['check-ignore', file], { cwd: root, encoding: 'utf8' }).trim(),
-    ).toBe(file);
-  const command = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
-    .scripts['deploy:cloudflare'];
-  expect(command).toBe('node scripts/deploy-cloudflare.mjs');
-});
-it('bundles the generated configuration with Wrangler dry-run without remote operations', () => {
+it('bundles generated configuration with a local-only Wrangler dry-run without Builds flags or auth', () => {
   const result = run();
   expect(result.status).toBe(0);
-  for (const directory of ['apps']) {
-    symlinkSync(
-      new URL(`../${directory}`, import.meta.url).pathname,
-      join(result.root, directory),
-      'dir',
-    );
-  }
+  symlinkSync(new URL('../apps', import.meta.url).pathname, join(result.root, 'apps'), 'dir');
   mkdirSync(join(result.root, 'dist'));
   writeFileSync(
     join(result.root, 'dist/index.html'),
@@ -167,14 +153,8 @@ it('bundles the generated configuration with Wrangler dry-run without remote ope
   const dryRun = spawnSync(
     new URL('../node_modules/.bin/wrangler', import.meta.url).pathname,
     ['deploy', '--dry-run', '--config', join(result.root, 'wrangler.deploy.jsonc')],
-    {
-      cwd: result.root,
-      encoding: 'utf8',
-      env: {
-        ...isolatedEnv(result.root),
-      },
-    },
+    { cwd: result.root, encoding: 'utf8', env: isolatedEnv(result.root) },
   );
-  expect(dryRun.status).toBe(0);
+  expect(dryRun.status, dryRun.stdout + dryRun.stderr).toBe(0);
   expect(dryRun.stdout).toContain('--dry-run: exiting now.');
 }, 30000);

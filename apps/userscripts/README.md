@@ -1,11 +1,16 @@
 # Finance userscripts
 
+Set `APP_HOSTNAME` in private Builds variables before building production artifacts.
+Metadata permissions/update URLs and runtime API/pairing links use its HTTPS origin.
+Without it, local validation uses `finance.example.com` (example only); Workers Builds
+fails closed when it is missing. Install only artifacts built for your actual hostname.
+
 `node build.mjs` (or the package build script) bundles two self-contained esbuild IIFEs into root `dist/scripts/`:
 
 - `portfolio.user.js`: Endowus, FSM and OCBC. Starts the allowlisted fetch/XHR capture bridge at document-start. A startup-only queue holds at most six events / four million JSON characters for at most 30 seconds, **in memory only**, to replay after remembered-key restoration or prompt unlock. Explicit lock/navigation clears it and disables further queuing. Otherwise unlock and reload the holdings route. Endowus joins require the same route/account context and request times within 15 seconds, allow union/subsets of goal IDs, flag missing/subset data and use the oldest actual component timestamp. Missing provider account context is explicitly unverified, not guessed from goal-set equality.
 - `bank-subcaps.user.js`: UOB and Maybank. After unlocking, explicitly capture the supported visible, uniquely scoped card table. Normalization comes exclusively from `@finance-tools/provider-adapters`.
 
-Install from `https://finance-tools.example.com/scripts/<name>.user.js` with a userscript manager supporting the declared legacy GM APIs. Each distributed script has separate pairing/session/storage. Create pairing, approve in the dashboard after inspecting name/scopes and supplying the code, return to redeem, then unlock the vault independently. Pairing never transfers keys.
+Install from `https://finance.example.com/scripts/<name>.user.js` with a userscript manager supporting the declared legacy GM APIs. Each distributed script has separate pairing/session/storage. Create pairing, approve in the dashboard after inspecting name/scopes and supplying the code, return to redeem, then unlock the vault independently. Pairing never transfers keys.
 
 The panel provides connect/redeem, passphrase or recovery unlock, lock/forget, disconnect, captured-history sync/pull, category assignment, settings JSON with three-way reconciliation, encrypted local-cache export/import and optional decrypted account export. Portfolio and bank scripts request separate product scopes; document writes carry their exact product. Product-specific current settings use `current_portfolio` and `current_bank-subcaps` IDs.
 

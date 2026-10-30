@@ -1132,12 +1132,8 @@ function Install() {
       <h2>Connect your portals</h2>
       <p>Install with a userscript manager, then pair each script separately.</p>
       <div className="links">
-        <a href="https://finance-tools.example.com/scripts/portfolio.user.js">
-          Install portfolio script
-        </a>
-        <a href="https://finance-tools.example.com/scripts/bank-subcaps.user.js">
-          Install bank subcaps script
-        </a>
+        <a href="/scripts/portfolio.user.js">Install portfolio script</a>
+        <a href="/scripts/bank-subcaps.user.js">Install bank subcaps script</a>
       </div>
     </section>
   );

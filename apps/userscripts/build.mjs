@@ -1,4 +1,9 @@
 import { build } from 'esbuild';
+import { appHostname } from '../../scripts/deployment-config.mjs';
+const hostname = appHostname(
+  process.env.APP_HOSTNAME ?? (process.env.WORKERS_CI === '1' ? undefined : 'finance.example.com'),
+);
+const origin = `https://${hostname}`;
 const alias = Object.fromEntries(
   ['client', 'contracts', 'crypto', 'provider-adapters', 'portfolio-domain', 'card-rules'].map(
     (name) => [
@@ -19,7 +24,7 @@ for (const [name, hosts] of Object.entries(matches)) {
   const metadata = [
     '// ==UserScript==',
     `// @name Finance ${name}`,
-    '// @namespace https://finance-tools.example.com',
+    '// @namespace https://finance.example.com',
     '// @version 0.1.0',
     '// @description Private encrypted finance capture; pair and unlock explicitly.',
     ...hosts.map((host) => `// @match ${host}`),
@@ -33,9 +38,9 @@ for (const [name, hosts] of Object.entries(matches)) {
     '// @grant GM_xmlhttpRequest',
     '// @grant GM_registerMenuCommand',
     ...(name === 'portfolio' ? ['// @grant unsafeWindow'] : []),
-    '// @connect finance-tools.example.com',
-    `// @updateURL https://finance-tools.example.com/scripts/${name}.user.js`,
-    `// @downloadURL https://finance-tools.example.com/scripts/${name}.user.js`,
+    `// @connect ${hostname}`,
+    `// @updateURL ${origin}/scripts/${name}.user.js`,
+    `// @downloadURL ${origin}/scripts/${name}.user.js`,
     '// ==/UserScript==',
   ].join('\n');
   await build({
@@ -47,5 +52,6 @@ for (const [name, hosts] of Object.entries(matches)) {
     banner: { js: metadata },
     legalComments: 'none',
     alias,
+    define: { __FINANCE_APP_ORIGIN__: JSON.stringify(origin) },
   });
 }

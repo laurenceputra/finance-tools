@@ -32,7 +32,7 @@ import { timestampSchema } from '@finance-tools/portfolio-domain';
 export { validateSettings, validateProductDocument } from './data';
 export { previewLegacyConfig } from './legacy';
 
-export const API = 'https://finance-tools.example.com/api/v1';
+export const API = '/api/v1';
 const MAX_BODY_BYTES = Math.ceil(1.1 * 1024 * 1024);
 function checkBodySize(body: unknown) {
   if (new TextEncoder().encode(JSON.stringify(body)).byteLength > MAX_BODY_BYTES)

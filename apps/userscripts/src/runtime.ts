@@ -1,5 +1,4 @@
 import {
-  API,
   FinanceClient,
   calendarCutoff,
   download,
@@ -25,6 +24,9 @@ import {
 import { evaluateMonthly, resolveCategory } from '@finance-tools/card-rules';
 import type { CardSettings } from '@finance-tools/card-rules';
 import { CaptureStore } from './capture-store';
+declare const __FINANCE_APP_ORIGIN__: string;
+const APP_ORIGIN = __FINANCE_APP_ORIGIN__;
+const API = `${APP_ORIGIN}/api/v1`;
 type Capture = PortfolioSnapshot | CardCapture;
 function ruleSettings(value: unknown): CardSettings {
   return parseCardSettings(value);
@@ -773,7 +775,7 @@ export function runtime(name: string) {
       'a',
       'Create vault / download recovery / change passphrase in dashboard',
     ) as HTMLAnchorElement;
-    vaultLink.href = 'https://finance-tools.example.com/';
+    vaultLink.href = `${APP_ORIGIN}/`;
     vaultLink.target = '_blank';
     vaultLink.rel = 'noopener noreferrer';
     button('Connect / create pairing', async () => {
@@ -789,7 +791,7 @@ export function runtime(name: string) {
       if (client.lockEpoch !== epoch) return;
       pairing = created;
       const link = text('a', 'Open dashboard to inspect and approve') as HTMLAnchorElement;
-      link.href = `https://finance-tools.example.com/?pairingId=${encodeURIComponent(created.pairingId)}&code=${created.code}`;
+      link.href = `${APP_ORIGIN}/?pairingId=${encodeURIComponent(created.pairingId)}&code=${created.code}`;
       link.target = '_blank';
       link.rel = 'noopener noreferrer';
       text(

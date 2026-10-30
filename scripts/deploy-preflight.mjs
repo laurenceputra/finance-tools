@@ -1,29 +1,29 @@
-import { readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { readFileSync, writeFileSync, renameSync, rmSync, mkdtempSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from 'jsonc-parser';
+import { appHostname } from './deployment-config.mjs';
 
-const root = fileURLToPath(new URL('../', import.meta.url));
 const output = new URL('../wrangler.deploy.jsonc', import.meta.url);
-const temporary = new URL('../wrangler.deploy.jsonc.tmp', import.meta.url);
+let temporary;
 try {
-  // Never reuse a previous build's deployment configuration.
+  // Remove stale private output even when validation fails.
   rmSync(output, { force: true });
-  rmSync(temporary, { force: true });
   if (process.env.WORKERS_CI !== '1' || process.env.WORKERS_CI_BRANCH !== 'main') {
     throw new Error(
       'Cloudflare Workers Builds on main is required (WORKERS_CI=1, WORKERS_CI_BRANCH=main).',
     );
   }
-  const account = process.env.CLOUDFLARE_ACCOUNT_ID ?? '';
-  const database = process.env.CLOUDFLARE_D1_DATABASE_ID ?? '';
-  if (!/^[0-9a-f]{32}$/i.test(account))
-    throw new Error('Invalid or missing CLOUDFLARE_ACCOUNT_ID.');
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(database)) {
-    throw new Error('Invalid or missing CLOUDFLARE_D1_DATABASE_ID.');
+  const hostname = appHostname(process.env.APP_HOSTNAME);
+  const databaseId = process.env.CLOUDFLARE_D1_DATABASE_ID;
+  if (
+    typeof databaseId !== 'string' ||
+    databaseId.trim() !== databaseId ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(databaseId) ||
+    databaseId === '00000000-0000-0000-0000-000000000000'
+  ) {
+    throw new Error('CLOUDFLARE_D1_DATABASE_ID must be the existing D1 database UUID.');
   }
-  if (!process.env.CLOUDFLARE_API_TOKEN?.trim())
-    throw new Error('Cloudflare Builds deployment credentials are required.');
   const errors = [];
   const config = parse(
     readFileSync(new URL('../wrangler.jsonc', import.meta.url), 'utf8'),
@@ -31,36 +31,31 @@ try {
     { allowTrailingComma: true },
   );
   if (errors.length || !config || typeof config !== 'object' || Array.isArray(config)) {
-    throw new Error('invalid Wrangler JSONC configuration.');
+    throw new Error('Invalid Wrangler JSONC template.');
   }
-  const binding = config.d1_databases?.find((entry) => entry.binding === 'DB');
-  if ('account_id' in config || binding?.database_id !== 'REPLACE_WITH_PROVISIONED_D1_ID') {
-    throw new Error('Tracked Wrangler configuration must contain only provisioning placeholders.');
+  if (
+    config.workers_dev !== false ||
+    config.preview_urls !== false ||
+    !Array.isArray(config.d1_databases) ||
+    config.d1_databases.length !== 1 ||
+    config.d1_databases[0]?.binding !== 'DB'
+  ) {
+    throw new Error('Template must contain one DB binding and disable workers.dev and previews.');
   }
-  if (config.workers_dev !== false || config.preview_urls !== false) {
-    throw new Error('workers.dev and preview URLs must remain disabled.');
-  }
-  const files = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' })
-    .split('\0')
-    .filter(Boolean);
-  for (const file of files) {
-    const contents = readFileSync(
-      new URL(file, new URL('../', import.meta.url)),
-      'utf8',
-    ).toLowerCase();
-    if (contents.includes(account.toLowerCase()) || contents.includes(database.toLowerCase())) {
-      throw new Error('Deployment identifiers must not appear in tracked files.');
-    }
-  }
-  config.account_id = account;
-  binding.database_id = database;
-  // Root placement preserves all template-relative entrypoint, asset and migration paths.
-  writeFileSync(temporary, JSON.stringify(config, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
-  renameSync(temporary, output);
+  config.d1_databases[0].database_id = databaseId;
+  config.routes = [{ pattern: hostname, custom_domain: true }];
+  config.vars = { ...config.vars, APP_ORIGIN: `https://${hostname}` };
+  // Same-directory rename is atomic; the private directory/file never allow other users access.
+  temporary = mkdtempSync(fileURLToPath(new URL('../.wrangler-deploy-', import.meta.url)));
+  const staged = join(temporary, 'config.jsonc');
+  writeFileSync(staged, JSON.stringify(config, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+  renameSync(staged, output);
 } catch (error) {
-  rmSync(temporary, { force: true });
+  rmSync(output, { force: true });
   console.error(
     `Deployment blocked: ${error instanceof Error && !('code' in error) ? error.message : 'Unable to prepare deployment configuration.'}`,
   );
   process.exitCode = 1;
+} finally {
+  if (temporary) rmSync(temporary, { recursive: true, force: true });
 }

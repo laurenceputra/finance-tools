@@ -6,15 +6,21 @@ from the root Wrangler configuration, not handwritten.
 
 ## Deployment requirements
 
-1. Install workspace dependencies with `corepack pnpm install`.
-2. Configure root D1 and apply `apps/api/migrations/0001_initial.sql` before
-   serving a fresh database. The application has never been deployed; its initial
-   schema includes required immutable encrypted payloads. No R2 binding or
+1. Install workspace dependencies with `corepack pnpm install --frozen-lockfile`.
+2. The deployed Worker and D1 already exist; root `wrangler.jsonc` is a placeholder
+   template. Set private Builds variables `CLOUDFLARE_D1_DATABASE_ID` and `APP_HOSTNAME`.
+   Main-only preflight generates ignored root `wrangler.deploy.jsonc`, setting the DB UUID,
+   custom-domain route and HTTPS `APP_ORIGIN`. Both remote migrations and deployment use
+   that same private config, which is cleaned up afterward. Builds applies migrations before deployment;
+   see the [production setup checklist](../../docs/SETUP.md) for native Builds token
+   permissions, including Account D1 Edit. The initial schema includes required
+   immutable encrypted payloads; future production changes need new backward-compatible
+   migrations. No R2 binding or
    subscription is required. Earlier disposable local development databases need
    recreation, not an in-place upgrade. No databases have been reset; preserve
    local user data and obtain separate authorization before any destructive step.
-3. Set the secrets/configuration shown in `.dev.vars.example` through Wrangler
-   secrets (or nonsecret vars where appropriate). JWT and wrapping secrets are
+3. Set production runtime secrets shown in `.dev.vars.example` through the Worker
+   dashboard (or nonsecret vars where appropriate). JWT and wrapping secrets are
    **independent random base64url 32-byte keys**. Never reuse Clerk keys.
 4. Configure Clerk's session JWT audience to `CLERK_AUDIENCE`, set the exact
    `CLERK_ISSUER`, and configure its signed `user.deleted` webhook at
@@ -157,7 +163,7 @@ one decoded byte over the shared `MAX_DOCUMENT_BYTES` is rejected with 413.
 Clerk verification uses current `@clerk/backend verifyToken` because the Clerk
 token arrives in a JSON body (not the request's bearer/cookie). Signature,
 audience, authorized party, expiry and issuer are checked. Own access JWTs use
-`jose` with HS256 only, fixed issuer `https://finance-tools.example.com`, fixed
+`jose` with HS256 only, fixed issuer `https://finance.example.com`, fixed
 audience `finance-tools-api-v1`, 15-minute TTL and per-request active D1 checks.
 Refresh idle expiry is 90 days; absolute expiry is fixed at 365 days.
 Signed Clerk session `sts` must be absent (standard active session JWT) or exactly

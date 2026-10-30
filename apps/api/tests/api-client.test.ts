@@ -13,7 +13,7 @@ import type {
 } from '@finance-tools/contracts';
 import { key, random } from '../src/security';
 
-const ORIGIN = 'https://finance-tools.example.com';
+const ORIGIN = 'https://finance.example.com';
 let mf: Miniflare, env: Env, privateKey: CryptoKey;
 let browserCookie = '',
   loseBrowser = '',
@@ -50,7 +50,8 @@ async function clerk(subject = 'user_client') {
 // CSRF and retry-ID headers. Only the network destination is local workerd.
 async function browserFetch(input: string | URL | Request, init: RequestInit = {}) {
   expect(init.credentials).toBe('include');
-  const url = String(input),
+  expect(String(input)).toMatch(/^\/api\/v1\//);
+  const url = new URL(String(input), ORIGIN).href,
     path = new URL(url).pathname.replace('/api/v1', '');
   const headers = new Headers(init.headers);
   headers.set('Origin', ORIGIN);

@@ -1,6 +1,9 @@
 import { readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { appHostname } from './deployment-config.mjs';
+
+const hostname = appHostname(process.env.APP_HOSTNAME ?? 'finance.example.com');
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const version = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version;
@@ -13,7 +16,7 @@ for (const name of ['portfolio', 'bank-subcaps']) {
     !contents.includes('// ==/UserScript==') ||
     !header.includes(`// @name Finance ${name}\n`) ||
     !header.includes(`// @version ${version}\n`) ||
-    !header.includes(`// @downloadURL https://finance-tools.example.com/scripts/${name}.user.js`)
+    !header.includes(`// @downloadURL https://${hostname}/scripts/${name}.user.js`)
   ) {
     throw new Error(`Invalid userscript metadata: ${name}`);
   }

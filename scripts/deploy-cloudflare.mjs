@@ -1,42 +1,8 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { rmSync } from 'node:fs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
-const values = ['CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_D1_DATABASE_ID', 'CLOUDFLARE_API_TOKEN']
-  .map((name) => process.env[name])
-  .filter(Boolean)
-  .sort((a, b) => b.length - a.length);
-
-function redactStream(destination) {
-  let pending = '';
-  const longest = Math.max(1, ...values.map((value) => value.length));
-  function drain(final = false) {
-    let output = '';
-    while (pending.length && (final || pending.length >= longest)) {
-      const match = values.find(
-        (value) => pending.slice(0, value.length).toLowerCase() === value.toLowerCase(),
-      );
-      if (match) {
-        output += '[REDACTED]';
-        pending = pending.slice(match.length);
-      } else {
-        output += pending[0];
-        pending = pending.slice(1);
-      }
-    }
-    if (output) destination.write(output);
-  }
-  return {
-    write(chunk) {
-      pending += chunk;
-      drain();
-    },
-    end() {
-      drain(true);
-    },
-  };
-}
-
 let active;
 let interrupted;
 for (const signal of ['SIGINT', 'SIGTERM']) {
@@ -47,22 +13,14 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 }
 function run(args) {
   return new Promise((resolve) => {
-    const stdout = redactStream(process.stdout);
-    const stderr = redactStream(process.stderr);
     const child = spawn(process.execPath, args, {
       cwd: root,
       env: process.env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', 'inherit', 'inherit'],
     });
     active = child;
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    child.stdout.on('data', stdout.write);
-    child.stderr.on('data', stderr.write);
-    child.on('error', () => stderr.write('Deployment blocked: unable to start deployment tool.\n'));
+    child.on('error', () => console.error('Deployment blocked: unable to start deployment tool.'));
     child.on('close', (code, signal) => {
-      stdout.end();
-      stderr.end();
       active = undefined;
       resolve({ code: code ?? 1, signal: signal ?? interrupted });
     });
@@ -102,4 +60,6 @@ try {
 } catch {
   console.error('Deployment blocked: unable to orchestrate deployment.');
   process.exitCode = 1;
+} finally {
+  rmSync(new URL('../wrangler.deploy.jsonc', import.meta.url), { force: true });
 }

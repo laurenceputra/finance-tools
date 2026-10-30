@@ -11,7 +11,7 @@ import { insertSession, newSession } from '../src/sessions';
 import { cleanup } from '../src/lifecycle';
 import type { Client, Session } from '../src/security';
 
-const ORIGIN = 'https://finance-tools.example.com';
+const ORIGIN = 'https://finance.example.com';
 let mf: Miniflare,
   env: Env,
   privateKey: CryptoKey,
