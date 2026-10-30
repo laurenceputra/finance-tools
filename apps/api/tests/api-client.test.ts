@@ -1,11 +1,16 @@
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import { Miniflare } from 'miniflare';
 import { build } from 'esbuild';
-import { readFile } from 'node:fs/promises';
+import { migrate } from './migrations';
 import { exportSPKI, generateKeyPair, SignJWT } from 'jose';
 import { FinanceClient, browserTransport } from '@finance-tools/client';
 import type { Storage, Transport } from '@finance-tools/client';
-import type { PairingResponse, SessionInfo, StoredDocument } from '@finance-tools/contracts';
+import type {
+  ExportPage,
+  PairingResponse,
+  SessionInfo,
+  StoredDocument,
+} from '@finance-tools/contracts';
 import { key, random } from '../src/security';
 
 const ORIGIN = 'https://finance-tools.example.com';
@@ -120,7 +125,6 @@ beforeAll(async () => {
     compatibilityDate: '2025-10-04',
     compatibilityFlags: ['nodejs_compat'],
     d1Databases: { DB: 'client' },
-    r2Buckets: { BLOBS: 'client' },
     bindings,
     outboundService: async (req) =>
       Response.json({
@@ -133,22 +137,9 @@ beforeAll(async () => {
   });
   env = {
     DB: await mf.getD1Database('DB'),
-    BLOBS: await mf.getR2Bucket('BLOBS'),
     ...bindings,
   } as unknown as Env;
-  const migration = await readFile(
-    new URL('../migrations/0001_initial.sql', import.meta.url),
-    'utf8',
-  );
-  const [tables, ...triggers] = migration.replace(/--[^\n]*/g, '').split('CREATE TRIGGER');
-  await env.DB.batch(
-    tables
-      .split(';')
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .map((s) => env.DB.prepare(s)),
-  );
-  for (const trigger of triggers) await env.DB.prepare('CREATE TRIGGER' + trigger).run();
+  await migrate(env.DB);
 });
 afterAll(async () => {
   vi.unstubAllGlobals();
@@ -170,8 +161,6 @@ beforeEach(async () => {
       'cleanup_state',
     ].map((table) => env.DB.prepare(`DELETE FROM ${table}`)),
   );
-  const page = await env.BLOBS.list();
-  if (page.objects.length) await env.BLOBS.delete(page.objects.map((o) => o.key));
   browserCookie = '';
   loseBrowser = '';
   loseGM = '';
@@ -208,6 +197,49 @@ async function pair(
   await script.redeem(p.pairingId, p.secret);
   return { script, gm };
 }
+
+it('assembles a full version-1 browser backup across count-bounded export requests', async () => {
+  const browser = new FinanceClient(browserTransport(), storage(), 'browser');
+  await browser.exchange(await clerk());
+  await browser.finishVault(await browser.prepareVault('test passphrase'));
+  await browser.put('settings', 'base', { private: 'encrypted only' }, 0);
+  const row = await env.DB.prepare("SELECT blob_key FROM documents WHERE id='base'").first<{
+    blob_key: string;
+  }>();
+  const statements = Array.from({ length: 102 }, (_, i) =>
+    env.DB.prepare(
+      "INSERT INTO documents(account_id,namespace,product,id,revision,blob_key,updated_at) VALUES(?,'settings','portfolio',?,1,?,?)",
+    ).bind(
+      browser.me!.accountId,
+      `z${String(i).padStart(3, '0')}`,
+      row!.blob_key,
+      new Date().toISOString(),
+    ),
+  );
+  for (let i = 0; i < statements.length; i += 40) await env.DB.batch(statements.slice(i, i + 40));
+  const backup = await browser.encryptedExport();
+  expect(backup.documents).toHaveLength(103);
+  expect(new Set(backup.documents.map((doc) => doc.id)).size).toBe(103);
+  expect(backup).not.toHaveProperty('cursor');
+  expect(browserRequests.filter((req) => req.path === '/export')).toHaveLength(2);
+  expect(JSON.stringify(backup)).not.toContain('encrypted only');
+  const normal = browser.transport;
+  browser.transport = async (...args) => {
+    const response = await normal(...args);
+    if (args[0].startsWith('/export?'))
+      return {
+        status: 200,
+        body: { ...(response.body as ExportPage), exportedAt: '2020-01-01T00:00:00.000Z' },
+      };
+    return response;
+  };
+  await expect(browser.encryptedExport()).rejects.toThrow('Export context mismatch');
+  browser.transport = async (...args) =>
+    args[0].startsWith('/export?')
+      ? { status: 500, body: { error: { code: 'storage_unavailable', message: 'Unavailable' } } }
+      : normal(...args);
+  await expect(browser.encryptedExport()).rejects.toMatchObject({ status: 500 });
+});
 
 it('integrates browser cookies and anonymous GM credentials through vault, pairing, product CRUD, refresh loss recovery, export and session revocation', async () => {
   const browser = new FinanceClient(browserTransport(), storage(), 'browser');

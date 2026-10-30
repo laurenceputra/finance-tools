@@ -1,13 +1,18 @@
 # API worker
 
 Hono worker implementing `/api/v1` with D1 as the atomic authorization/CAS
-boundary and immutable, encrypted-only R2 objects. Binding types are generated
+boundary and immutable, encrypted-only envelope rows. Binding types are generated
 from the root Wrangler configuration, not handwritten.
 
 ## Deployment requirements
 
 1. Install workspace dependencies with `corepack pnpm install`.
-2. Configure root D1/R2 resources and apply `apps/api/migrations` before serving.
+2. Configure root D1 and apply `apps/api/migrations/0001_initial.sql` before
+   serving a fresh database. The application has never been deployed; its initial
+   schema includes required immutable encrypted payloads. No R2 binding or
+   subscription is required. Earlier disposable local development databases need
+   recreation, not an in-place upgrade. No databases have been reset; preserve
+   local user data and obtain separate authorization before any destructive step.
 3. Set the secrets/configuration shown in `.dev.vars.example` through Wrangler
    secrets (or nonsecret vars where appropriate). JWT and wrapping secrets are
    **independent random base64url 32-byte keys**. Never reuse Clerk keys.
@@ -19,35 +24,38 @@ from the root Wrangler configuration, not handwritten.
    Both exchange and deletion require `CLERK_SECRET_KEY`: they read trusted
    Backend User eligibility, and deletion additionally checks MFA enrollment,
    even with networkless JWT signature verification.
-5. **Root owner must configure scheduled triggers**, ideally hourly (at minimum
-   daily), for retention/account/orphan cleanup. This agent does not edit root
-   Wrangler configuration. Every expiry stage mutates at most 1,000 indexed rows.
+5. Root Wrangler config schedules hourly retention/account cleanup.
+   Every expiry stage mutates at most 1,000 indexed rows.
    Session cleanup selects at most 100 expired sessions and deletes at most 1,000
    family hashes before removing unreferenced sessions. Each invocation advances
-   at most 10 pending deleted accounts, 1,000 records/table/account, and 10,000
-   unreferenced R2 objects. Increase invocation frequency if cleanup backlog grows. Inventory
-   sweeps up to twenty 1,000-object pages per invocation with a durable cursor.
+   one pending deleted account and one pending revocation account, with durable
+   round-robin cursors, and at most 1,000 records/table/account. Physical payload
+   deletion is four SQL batches of four unreferenced rows. There is no cross-store inventory
+   sweep; each ciphertext exists only in its registered SQL row. Cleanup uses at
+   most 26 statements, below the Free 50-statement budget. Monitor backlog and
+   tune frequency with approval; large deletions take multiple invocations.
 6. Ensure root static-assets routing passes `.user.js` requests to the Worker
    if relying on its JavaScript content-type override; otherwise configure the
    equivalent static asset `_headers`. SPA fallbacks must not serve HTML for
    nonexistent userscript downloads.
-7. Use **Workers Paid** for this backend ("free" entitlements refer to the app,
-   not the Cloudflare runtime plan). Root owner should set
-   `limits.subrequests: 12000` so a full 10,000-document streamed export has room
-   for its R2 reads plus metadata/authorization pages. Free-plan subrequest/CPU
-   limits are insufficient for large exports and cleanup batches. HTTP export
-   metadata is fetched in 100-row seek pages, not one full-table scan per object.
+7. The backend targets **Workers Free**, with no Paid subrequest override. Export
+   uses separate, reauthorized requests, at most 100 documents / 2 MiB envelope
+   JSON plus metadata allowance per page, and one bulk payload query after
+   metadata selection. Free has 10 ms CPU per HTTP/cron invocation, 50 D1
+   statements/invocation, a 500 MB/database limit and 2 MB/row limit. The 1 MiB
+   ciphertext envelope expands to about 1.4 MB JSON. Local tests do not measure
+   or certify production Free CPU/daily read/write quotas; monitor those limits.
 
 Run:
 
 ```sh
-corepack pnpm exec wrangler types --env-file .dev.vars.example --strict-vars false
+corepack pnpm types:worker
 corepack pnpm --filter @finance-tools/api typecheck
 corepack pnpm --filter @finance-tools/api test
 ```
 
 Tests bundle and execute the actual Worker inside workerd, with real SQLite/D1
-and R2 through pinned Miniflare `4.20251004.0`, not a mock database. Clerk tests
+through pinned Miniflare `4.20251004.0`, not a mock database. Clerk tests
 use real RSA signatures and public-key verification. The pinned test runtime
 uses compatibility date `2025-10-04`; production uses the root Wrangler date.
 `tests/api-client.test.ts` uses the actual FinanceClient/browserTransport plus an
@@ -112,10 +120,10 @@ one decoded byte over the shared `MAX_DOCUMENT_BYTES` is rejected with 413.
   not part of these contracts, and accepting arbitrary increments would strand
   all existing ciphertext. Envelope versions must match the vault exactly.
 - Free quota is 10,000 live documents plus **64 MiB stored envelope JSON across
-  committed, reserved and not-yet-cleaned abandoned versions**. Old immutable settings versions retained
+  current, retained and not-yet-cleaned unreferenced versions**. Old immutable settings versions retained
   for perpetual mutation replay consume quota too. History versions are removed
   at their own three-calendar-month cutoff, even if overwritten/deleted earlier.
-  No hidden unlimited version-history allowance. Export is streamed encrypted
+  No hidden unlimited version-history allowance. Export is paged encrypted
   JSON; concurrent edits may appear in later pages (not a snapshot).
 - An independent **16 MiB logical metadata budget and 50,000 receipt limit**
   cap permanent vault responses, mutation receipts, revision tombstones and blob
@@ -123,14 +131,18 @@ one decoded byte over the shared `MAX_DOCUMENT_BYTES` is rejected with 413.
   plus conservative row/index allowances (512 bytes/document, blob or receipt,
   1,024/session or approved pairing, 768/refresh predecessor). These are logical
   application budgets, not measurements of SQLite file pages or Time Travel.
-  Repeated delete/vault writes cannot bypass quotas through lack of an R2 upload.
+  Repeated delete/vault writes cannot bypass quotas through lack of a payload write.
   Identical replay remains available at the cap, without allocating a new receipt.
   Expired history receipts retain their charged identity/hash but release response
   bytes when scrubbed; account cleanup releases records in bounded batches.
 - List responses have a **2 MiB page budget**, using registered blob byte sizes
   plus response metadata allowance before fetching ciphertext. Even `limit=100`
   can return fewer documents, with a cursor after the last included ID; no large
-  documents are skipped. At most one bounded envelope is buffered during export.
+  documents are skipped. List/export fetch only the selected page in one
+  ownership-scoped SQL query and fail closed on missing/corrupt envelopes.
+  The 500 MB shared database includes every account, retained versions, metadata
+  and indexes; per-account quotas are not reserved physical capacity. Monitor
+  database size and deny/limit new usage before physical capacity is exhausted.
 - Account deletion immediately leaves a permanent disabled subject tombstone,
   immediately invalidates all sessions through the account's disabled-state check,
   clears the vault and schedules durable cleanup. It does not scan/write every
@@ -162,10 +174,10 @@ state, and bans win equal timestamps. Trusted User observations use `updatedAt`
 on the same state clock. A ban increments an account epoch, invalidating all
 old Finance sessions and approved pairings immediately without an unbounded
 session update. Authorization, refresh, session insertion, pairing approval/
-redemption, streamed export and CAS commits check disabled state and epoch.
+redemption, each export page and CAS commits check disabled state and epoch.
 Unban re-enables login but never restores old sessions/pairings; account deletion
 cannot be undone by either event. Cleanup marks at most 1,000 old-epoch sessions
-per account for at most 10 pending accounts per invocation, then drains their
+per account for one pending account per invocation, then drains their
 refresh records through the existing bounded expiry path. Ban does not purge the
 vault/documents or create a deletion tombstone.
 
@@ -206,10 +218,14 @@ acceptance/revocation is transactional and lifecycle operations are idempotent.
 Webhook IDs expire after one year (Svix's short timestamp window prevents old
 signed requests from becoming valid again).
 
-R2 cannot join a D1 transaction. Pending uploads are registered before put and
-commit requires an unexpired pending row; abandoned uploads are marked deleting
-before removal. Random object keys never get reused. Inventory also removes
-late uploads which finished after an account/pending row was deleted. Such
-unreferenced objects may remain until the next inventory pass; no read route
-exposes them. Retention tombstones and payload hashes remain but expired history
+D1 stores an encrypted envelope once per immutable version. One command-trigger
+operation checks active account/session, persisted scopes, key version, revision,
+retention and quotas, inserts the payload, updates the document pointer and records
+the mutation receipt. Any failure rolls back all effects; concurrent identical
+replay returns the original receipt/envelope without inserting another payload.
+There are no upload reservations or pending/deleting payload states. Random keys
+never get reused and payload rows cannot be updated. Bounded SQL deletion directly
+and atomically checks both document and receipt references, retaining original
+settings ciphertext for perpetual mutation replay. Retention tombstones and
+payload hashes remain but expired history
 receipts have ciphertext pointers/responses scrubbed, returning 410 on replay.

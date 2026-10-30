@@ -100,6 +100,9 @@ it('injects synthetic identifiers into the actual template without changing bind
   expect(result.status, result.stderr).toBe(0);
   const generated = JSON.parse(readFileSync(join(result.root, 'wrangler.deploy.jsonc'), 'utf8'));
   const template = parse(readFileSync(new URL('../wrangler.jsonc', import.meta.url), 'utf8'));
+  expect(template).not.toHaveProperty('r2_buckets');
+  expect(template).not.toHaveProperty('limits.subrequests');
+  expect(template.d1_databases).toHaveLength(1);
   expect(generated).toEqual({
     ...template,
     account_id: account,

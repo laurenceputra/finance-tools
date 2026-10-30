@@ -12,6 +12,7 @@ import type {
 import {
   documentPutRequestSchema,
   encryptedEnvelopeSchema,
+  exportPageSchema,
   idSchema,
   namespaceSchema,
   productSchema,
@@ -65,7 +66,7 @@ export function browserTransport(base = API): Transport {
     const response = await fetch(base + path, {
       method,
       credentials: 'include',
-      signal: AbortSignal.timeout(path === '/export' ? 120_000 : 15_000),
+      signal: AbortSignal.timeout(15_000),
       headers: {
         ...headers,
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
@@ -890,7 +891,37 @@ export class FinanceClient {
     }
   }
   async encryptedExport() {
-    return this.request<ExportResponse>('/export');
+    const epoch = this.generation,
+      accountId = this.account();
+    const seen = new Set<string>();
+    let cursor: string | null = null;
+    let backup: ExportResponse | undefined;
+    do {
+      const page = exportPageSchema.parse(
+        await this.request<unknown>(
+          cursor ? `/export?cursor=${encodeURIComponent(cursor)}` : '/export',
+        ),
+      );
+      this.guard(epoch, accountId);
+      if (page.accountId !== accountId) throw new Error('Export account mismatch');
+      if (!backup)
+        backup = {
+          version: 1,
+          accountId,
+          exportedAt: page.exportedAt,
+          vault: page.vault,
+          documents: [],
+        };
+      if (page.exportedAt !== backup.exportedAt) throw new Error('Export context mismatch');
+      backup.documents.push(...page.documents);
+      cursor = page.cursor;
+      if (cursor) {
+        if (!page.documents.length || seen.has(cursor))
+          throw new Error('Invalid export continuation');
+        seen.add(cursor);
+      }
+    } while (cursor);
+    return backup;
   }
   async decryptedExport() {
     const epoch = this.generation,

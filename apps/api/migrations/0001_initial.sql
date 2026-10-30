@@ -38,13 +38,10 @@ CREATE INDEX pairings_expires ON pairings(expires,id);
 CREATE INDEX pairings_account ON pairings(account_id,id);
 CREATE TABLE blobs (
  key TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id), bytes INTEGER NOT NULL,
- state TEXT NOT NULL CHECK(state IN ('pending','committed','deleting')), expires INTEGER NOT NULL,
- occurred_at TEXT, created_at INTEGER NOT NULL
+ envelope TEXT NOT NULL, occurred_at TEXT, created_at INTEGER NOT NULL
 );
-CREATE INDEX blobs_account ON blobs(account_id,state);
-CREATE INDEX blobs_state_expiry ON blobs(state,expires,key);
-CREATE INDEX blobs_history ON blobs(occurred_at,key) WHERE occurred_at IS NOT NULL AND state<>'deleting';
-CREATE INDEX blobs_account_cleanup ON blobs(account_id,key) WHERE state<>'deleting';
+CREATE INDEX blobs_account ON blobs(account_id,key);
+CREATE INDEX blobs_cleanup ON blobs(created_at,key);
 CREATE TABLE documents (
  account_id TEXT NOT NULL REFERENCES accounts(id), namespace TEXT NOT NULL, id TEXT NOT NULL,
  product TEXT NOT NULL CHECK(product IN ('portfolio','bank-subcaps')),
@@ -114,6 +111,9 @@ END;
 CREATE TRIGGER blob_release AFTER DELETE ON blobs BEGIN
  UPDATE accounts SET metadata_bytes=MAX(0,metadata_bytes-512) WHERE id=OLD.account_id;
 END;
+CREATE TRIGGER payload_immutable BEFORE UPDATE ON blobs BEGIN
+ SELECT RAISE(ABORT,'payload_immutable');
+END;
 CREATE TRIGGER vault_resize AFTER UPDATE OF vault ON accounts BEGIN
  UPDATE accounts SET metadata_bytes=MAX(0,metadata_bytes+COALESCE(length(CAST(NEW.vault AS BLOB)),0)-COALESCE(length(CAST(OLD.vault AS BLOB)),0)) WHERE id=NEW.id;
 END;
@@ -145,13 +145,13 @@ CREATE TRIGGER pairing_release AFTER DELETE ON pairings WHEN OLD.account_id IS N
  UPDATE accounts SET metadata_bytes=MAX(0,metadata_bytes-1024) WHERE id=OLD.account_id;
 END;
 
--- A command row is an atomic CAS, receipt and pointer update. RAISE aborts the
--- entire D1 batch; no application read/modify/write lock is required.
+-- A command atomically inserts an immutable payload, updates the CAS pointer and
+-- records its receipt. RAISE aborts all effects; replay allocates no payload.
 CREATE TABLE commands (
  id TEXT PRIMARY KEY, account_id TEXT NOT NULL, session_id TEXT NOT NULL, namespace TEXT NOT NULL,
  product TEXT,
  document_id TEXT NOT NULL, mutation_id TEXT NOT NULL, hash TEXT NOT NULL,
- expected INTEGER NOT NULL, blob_key TEXT, occurred_at TEXT, response TEXT,
+ expected INTEGER NOT NULL, blob_key TEXT, envelope TEXT, occurred_at TEXT, response TEXT,
  vault TEXT, key_version INTEGER, now INTEGER NOT NULL, updated_at TEXT NOT NULL, cutoff TEXT NOT NULL
 );
 CREATE TRIGGER apply_command BEFORE INSERT ON commands BEGIN
@@ -159,7 +159,17 @@ CREATE TRIGGER apply_command BEFORE INSERT ON commands BEGIN
   SELECT 1 FROM accounts a JOIN sessions s ON s.account_id=a.id WHERE a.id=NEW.account_id
    AND a.deleted_at IS NULL AND a.disabled_at IS NULL AND s.account_epoch=a.session_epoch AND s.id=NEW.session_id AND s.revoked_at IS NULL
   AND s.idle_expires>NEW.now AND s.absolute_expires>NEW.now
- ) THEN RAISE(ABORT,'inactive') END;
+  ) THEN RAISE(ABORT,'inactive') END;
+ SELECT CASE WHEN NEW.namespace='vault' AND NOT EXISTS(
+  SELECT 1 FROM sessions WHERE id=NEW.session_id AND json_extract(client,'$.kind')='browser')
+  THEN RAISE(ABORT,'browser_required') END;
+ SELECT CASE WHEN NEW.namespace<>'vault' AND NOT EXISTS(
+  SELECT 1 FROM sessions s,json_each(s.client,'$.namespaces') n WHERE s.id=NEW.session_id AND n.value=NEW.namespace)
+  THEN RAISE(ABORT,'namespace_scope') END;
+ SELECT CASE WHEN NEW.namespace<>'vault' AND (
+  NOT EXISTS(SELECT 1 FROM sessions s,json_each(s.client,'$.products') p WHERE s.id=NEW.session_id AND p.value=NEW.product)
+  OR EXISTS(SELECT 1 FROM documents WHERE account_id=NEW.account_id AND namespace=NEW.namespace AND id=NEW.document_id AND product<>NEW.product))
+  THEN RAISE(ABORT,'product_scope') END;
  SELECT CASE WHEN EXISTS (SELECT 1 FROM mutations WHERE account_id=NEW.account_id
   AND namespace=NEW.namespace AND document_id=NEW.document_id AND id=NEW.mutation_id AND hash<>NEW.hash)
   THEN RAISE(ABORT,'mutation_conflict') END;
@@ -167,11 +177,8 @@ CREATE TRIGGER apply_command BEFORE INSERT ON commands BEGIN
   AND namespace=NEW.namespace AND document_id=NEW.document_id AND id=NEW.mutation_id AND hash=NEW.hash)
   THEN RAISE(IGNORE) END;
  SELECT CASE WHEN (SELECT receipt_count>=receipt_limit FROM accounts WHERE id=NEW.account_id) THEN RAISE(ABORT,'metadata_quota') END;
- SELECT CASE WHEN NEW.namespace<>'vault' AND (
-  NOT EXISTS(SELECT 1 FROM sessions s,json_each(s.client,'$.products') p WHERE s.id=NEW.session_id AND p.value=NEW.product)
-  OR EXISTS(SELECT 1 FROM documents WHERE account_id=NEW.account_id AND namespace=NEW.namespace AND id=NEW.document_id AND product<>NEW.product))
-  THEN RAISE(ABORT,'product_scope') END;
  SELECT CASE WHEN (SELECT metadata_bytes+512+COALESCE(length(CAST(NEW.response AS BLOB)),0)
+  +CASE WHEN NEW.blob_key IS NOT NULL THEN 512 ELSE 0 END
   +CASE WHEN NEW.namespace='vault' THEN COALESCE(length(CAST(NEW.vault AS BLOB)),0)-COALESCE(length(CAST(vault AS BLOB)),0)
     WHEN NOT EXISTS(SELECT 1 FROM documents WHERE account_id=NEW.account_id AND namespace=NEW.namespace AND id=NEW.document_id) THEN 512 ELSE 0 END
   >metadata_limit FROM accounts WHERE id=NEW.account_id) THEN RAISE(ABORT,'metadata_quota') END;
@@ -182,25 +189,26 @@ CREATE TRIGGER apply_command BEFORE INSERT ON commands BEGIN
   THEN RAISE(ABORT,'revision_conflict') END;
  SELECT CASE WHEN NEW.namespace='vault' AND EXISTS (SELECT 1 FROM accounts WHERE id=NEW.account_id
   AND key_version IS NOT NULL AND key_version<>NEW.key_version) THEN RAISE(ABORT,'key_version') END;
- SELECT CASE WHEN NEW.blob_key IS NOT NULL AND NOT EXISTS (SELECT 1 FROM accounts a JOIN blobs b ON b.account_id=a.id
-  WHERE a.id=NEW.account_id AND a.key_version=NEW.key_version AND b.key=NEW.blob_key
-  AND b.state='pending' AND b.expires>NEW.now) THEN RAISE(ABORT,'key_version') END;
+ SELECT CASE WHEN NEW.blob_key IS NOT NULL AND NOT EXISTS (SELECT 1 FROM accounts
+  WHERE id=NEW.account_id AND key_version=NEW.key_version) THEN RAISE(ABORT,'key_version') END;
  SELECT CASE WHEN NEW.namespace='history' AND NEW.blob_key IS NOT NULL AND NEW.occurred_at<NEW.cutoff
   THEN RAISE(ABORT,'expired_history') END;
  SELECT CASE WHEN NEW.blob_key IS NOT NULL AND
   ((SELECT COUNT(*) FROM documents WHERE account_id=NEW.account_id AND blob_key IS NOT NULL)
     + CASE WHEN EXISTS(SELECT 1 FROM documents WHERE account_id=NEW.account_id AND namespace=NEW.namespace AND id=NEW.document_id AND blob_key IS NOT NULL) THEN 0 ELSE 1 END
     >(SELECT max_documents FROM accounts WHERE id=NEW.account_id)
-   OR (SELECT COALESCE(SUM(bytes),0) FROM blobs WHERE account_id=NEW.account_id)
+   OR (SELECT COALESCE(SUM(bytes),0) FROM blobs WHERE account_id=NEW.account_id)+length(CAST(NEW.envelope AS BLOB))
     >(SELECT max_bytes FROM accounts WHERE id=NEW.account_id))
   THEN RAISE(ABORT,'quota') END;
+ INSERT INTO blobs(key,account_id,bytes,envelope,occurred_at,created_at)
+  SELECT NEW.blob_key,NEW.account_id,length(CAST(NEW.envelope AS BLOB)),NEW.envelope,NEW.occurred_at,NEW.now
+  WHERE NEW.blob_key IS NOT NULL;
  UPDATE accounts SET vault=NEW.vault,vault_revision=vault_revision+1,key_version=NEW.key_version
   WHERE id=NEW.account_id AND NEW.namespace='vault' AND NOT EXISTS(SELECT 1 FROM mutations WHERE account_id=NEW.account_id AND namespace=NEW.namespace AND document_id=NEW.document_id AND id=NEW.mutation_id);
  INSERT INTO documents(account_id,namespace,id,product,revision,blob_key,occurred_at,updated_at)
   SELECT NEW.account_id,NEW.namespace,NEW.document_id,NEW.product,NEW.expected+1,NEW.blob_key,NEW.occurred_at,NEW.updated_at
   WHERE NEW.namespace<>'vault' AND NOT EXISTS(SELECT 1 FROM mutations WHERE account_id=NEW.account_id AND namespace=NEW.namespace AND document_id=NEW.document_id AND id=NEW.mutation_id)
   ON CONFLICT(account_id,namespace,id) DO UPDATE SET revision=excluded.revision,blob_key=excluded.blob_key,occurred_at=excluded.occurred_at,updated_at=excluded.updated_at;
- UPDATE blobs SET state='committed' WHERE key=NEW.blob_key AND NOT EXISTS(SELECT 1 FROM mutations WHERE account_id=NEW.account_id AND namespace=NEW.namespace AND document_id=NEW.document_id AND id=NEW.mutation_id);
  INSERT OR IGNORE INTO mutations(account_id,namespace,document_id,product,id,hash,status,response,blob_key,occurred_at,created_at,metadata_size)
   VALUES(NEW.account_id,NEW.namespace,NEW.document_id,NEW.product,NEW.mutation_id,NEW.hash,
    CASE WHEN NEW.namespace<>'vault' AND NEW.blob_key IS NULL THEN 204 ELSE 200 END,NEW.response,NEW.blob_key,NEW.occurred_at,NEW.now,512+COALESCE(length(CAST(NEW.response AS BLOB)),0));

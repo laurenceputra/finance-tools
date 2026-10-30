@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { Miniflare } from 'miniflare';
-import { readFile } from 'node:fs/promises';
+import { migrate } from './migrations';
 import { exportSPKI, generateKeyPair, SignJWT } from 'jose';
 import { build } from 'esbuild';
 import { Webhook } from 'svix';
@@ -147,7 +147,6 @@ beforeAll(async () => {
     compatibilityFlags: ['nodejs_compat'],
     unsafeTriggerHandlers: true,
     d1Databases: { DB: 'test' },
-    r2Buckets: { BLOBS: 'test' },
     bindings,
     serviceBindings: { ASSETS: async () => new Response('asset') },
     outboundService: async (req) => {
@@ -164,24 +163,9 @@ beforeAll(async () => {
   });
   env = {
     DB: await mf.getD1Database('DB'),
-    BLOBS: await mf.getR2Bucket('BLOBS'),
     ...bindings,
   } as unknown as Env;
-  const migration = await readFile(
-    new URL('../migrations/0001_initial.sql', import.meta.url),
-    'utf8',
-  );
-  // D1.exec splits on lines and cannot apply multiline trigger bodies. Pass
-  // each complete statement through prepare instead, as Wrangler does.
-  const [tables, ...triggers] = migration.replace(/--[^\n]*/g, '').split('CREATE TRIGGER');
-  await env.DB.batch(
-    tables
-      .split(';')
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .map((s) => env.DB.prepare(s)),
-  );
-  for (const trigger of triggers) await env.DB.prepare('CREATE TRIGGER' + trigger).run();
+  await migrate(env.DB);
 });
 afterAll(async () => {
   await mf?.dispose();
@@ -208,8 +192,6 @@ beforeEach(async () => {
   await env.DB.prepare(
     'UPDATE admission_limits SET max_pairings=1000,max_rates=10000 WHERE id=1',
   ).run();
-  const page = await env.BLOBS.list();
-  if (page.objects.length) await env.BLOBS.delete(page.objects.map((o) => o.key));
   await env.DB.prepare('INSERT INTO accounts(id,subject,created_at) VALUES(?,?,?)')
     .bind('account_a', 'user_a', Date.now())
     .run();
@@ -234,7 +216,7 @@ beforeEach(async () => {
   ).toBe(200);
 });
 
-describe('real D1/R2 API security', () => {
+describe('real D1 API security', () => {
   it('verifies Clerk signatures/freshness and only exchanges browser sessions', async () => {
     const valid = await clerk();
     expect(
@@ -462,25 +444,137 @@ describe('real D1/R2 API security', () => {
     const concurrent = await Promise.all(Array.from({ length: 8 }, () => put('a', 1)));
     expect(concurrent.filter((r) => r.status === 200)).toHaveLength(1);
     expect(concurrent.filter((r) => r.status === 409)).toHaveLength(7);
+    expect((await env.DB.prepare('SELECT key FROM blobs').all()).results).toHaveLength(2);
     const deletion = { expectedRevision: 2, mutationId: crypto.randomUUID() };
     expect((await request('/documents/settings/a', 'DELETE', deletion)).status).toBe(204);
     expect((await request('/documents/settings/a', 'DELETE', deletion)).status).toBe(204);
     expect((await put('a', 0)).status).toBe(409);
     expect((await put('a', 3)).status).toBe(200);
   });
-  it('serializes concurrent quota reservations and document count commits', async () => {
+  it('atomically serializes concurrent payload bytes and document count quotas without orphan writes', async () => {
     await env.DB.prepare('UPDATE accounts SET max_documents=1 WHERE id=?').bind('account_a').run();
     const responses = await Promise.all([put('a'), put('b'), put('c')]);
     expect(responses.filter((r) => r.status === 200)).toHaveLength(1);
     expect(responses.filter((r) => r.status === 413)).toHaveLength(2);
-    await cleanup(env);
-    const sum = await env.DB.prepare(
-      "SELECT SUM(bytes) AS bytes FROM blobs WHERE state='committed'",
-    ).first<{ bytes: number }>();
+    expect((await env.DB.prepare('SELECT key FROM blobs').all()).results).toHaveLength(1);
+    const sum = await env.DB.prepare('SELECT SUM(bytes) AS bytes FROM blobs').first<{
+      bytes: number;
+    }>();
     await env.DB.prepare('UPDATE accounts SET max_bytes=? WHERE id=?')
       .bind(sum!.bytes, 'account_a')
       .run();
     expect((await put('d')).status).toBe(413);
+    await env.DB.prepare("UPDATE accounts SET max_documents=10000,max_bytes=? WHERE id='account_a'")
+      .bind(sum!.bytes * 2)
+      .run();
+    const bytes = await Promise.all([put('e'), put('f'), put('g')]);
+    expect(bytes.filter((r) => r.status === 200)).toHaveLength(1);
+    expect(bytes.filter((r) => r.status === 413)).toHaveLength(2);
+    expect((await env.DB.prepare('SELECT key FROM blobs').all()).results).toHaveLength(2);
+  });
+  it('replays concurrent identical mutations with exactly the original envelope and one payload', async () => {
+    const input = {
+      expectedRevision: 0,
+      mutationId: crypto.randomUUID(),
+      product: 'portfolio',
+      envelope: encrypted,
+    };
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () => request('/documents/settings/replay', 'PUT', input)),
+    );
+    expect(results.every((result) => result.status === 200)).toBe(true);
+    const values = await Promise.all(results.map((result) => result.json()));
+    for (const value of values) expect(value).toEqual(values[0]);
+    expect((await env.DB.prepare('SELECT key FROM blobs').all()).results).toHaveLength(1);
+    expect(
+      (await put('replay', 1, 'settings', { envelope: { ...encrypted, iv: 'BAAAAAAAAAAAAAAA' } }))
+        .status,
+    ).toBe(200);
+    await cleanup(env);
+    expect(await (await request('/documents/settings/replay', 'PUT', input)).json()).toEqual(
+      values[0],
+    );
+    expect((await env.DB.prepare('SELECT key FROM blobs').all()).results).toHaveLength(2);
+  });
+  it('rolls back payload, document pointer, receipt and metadata together on a late SQL failure', async () => {
+    expect((await put('rollback')).status).toBe(200);
+    const snapshot = async () =>
+      Promise.all(
+        ['blobs', 'documents', 'mutations', 'accounts', 'commands'].map(
+          async (table) => (await env.DB.prepare(`SELECT * FROM ${table}`).all()).results,
+        ),
+      );
+    const before = await snapshot();
+    await env.DB.prepare(
+      `CREATE TRIGGER fail_receipt AFTER INSERT ON mutations WHEN NEW.document_id='rollback' BEGIN SELECT RAISE(ABORT,'test_failure'); END`,
+    ).run();
+    try {
+      expect((await put('rollback', 1)).status).toBe(500);
+      expect(await snapshot()).toEqual(before);
+    } finally {
+      await env.DB.prepare('DROP TRIGGER fail_receipt').run();
+    }
+  });
+  it('checks persisted authorization and key state at SQL commit before allocating a payload', async () => {
+    const commit = () =>
+      env.DB.prepare(
+        `INSERT INTO commands(id,account_id,session_id,namespace,product,document_id,mutation_id,hash,expected,blob_key,envelope,key_version,now,updated_at,cutoff)
+      VALUES(?,'account_a',?,'settings','portfolio','commit_guard',?,'hash',0,?,?,1,?,?,?)`,
+      )
+        .bind(
+          random(),
+          browserSession.id,
+          crypto.randomUUID(),
+          random(),
+          JSON.stringify(encrypted),
+          Date.now(),
+          new Date().toISOString(),
+          historyCutoff(),
+        )
+        .run();
+    const cases = [
+      ["UPDATE accounts SET deleted_at=1 WHERE id='account_a'", 'inactive'],
+      ["UPDATE accounts SET disabled_at=1 WHERE id='account_a'", 'inactive'],
+      ["UPDATE accounts SET session_epoch=1 WHERE id='account_a'", 'inactive'],
+      ['UPDATE sessions SET revoked_at=1 WHERE id=?', 'inactive'],
+      ['UPDATE sessions SET idle_expires=0 WHERE id=?', 'inactive'],
+      ['UPDATE sessions SET absolute_expires=0 WHERE id=?', 'inactive'],
+      [
+        "UPDATE sessions SET client=json_set(client,'$.namespaces',json('[]')) WHERE id=?",
+        'namespace_scope',
+      ],
+      [
+        "UPDATE sessions SET client=json_set(client,'$.products',json('[]')) WHERE id=?",
+        'product_scope',
+      ],
+      ["UPDATE accounts SET key_version=2 WHERE id='account_a'", 'key_version'],
+    ];
+    for (const [sql, error] of cases) {
+      await (
+        sql.includes('?') ? env.DB.prepare(sql).bind(browserSession.id) : env.DB.prepare(sql)
+      ).run();
+      await expect(commit()).rejects.toThrow(error);
+      expect((await env.DB.prepare('SELECT key FROM blobs').all()).results).toHaveLength(0);
+      expect((await env.DB.prepare('SELECT id FROM documents').all()).results).toHaveLength(0);
+      expect(
+        (await env.DB.prepare("SELECT id FROM mutations WHERE namespace<>'vault'").all()).results,
+      ).toHaveLength(0);
+      await env.DB.batch([
+        env.DB.prepare(
+          "UPDATE accounts SET deleted_at=NULL,disabled_at=NULL,session_epoch=0,key_version=1 WHERE id='account_a'",
+        ),
+        env.DB.prepare(
+          'UPDATE sessions SET revoked_at=NULL,idle_expires=?,absolute_expires=?,client=? WHERE id=?',
+        ).bind(
+          browserSession.idle_expires,
+          browserSession.absolute_expires,
+          JSON.stringify(client),
+          browserSession.id,
+        ),
+      ]);
+    }
+    await commit();
+    expect((await env.DB.prepare('SELECT key FROM blobs').all()).results).toHaveLength(1);
   });
   it('rejects structurally invalid ciphertext and unsafe key version changes', async () => {
     expect(
@@ -526,8 +620,7 @@ describe('real D1/R2 API security', () => {
     ).toBe(200);
     expect((await put('settings')).status).toBe(200);
     await cleanup(env, Date.now() + 130 * 86400000);
-    const objects = await env.BLOBS.list();
-    expect(objects.objects).toHaveLength(1);
+    expect((await env.DB.prepare('SELECT key FROM blobs').all()).results).toHaveLength(1);
     const rows = await env.DB.prepare(
       "SELECT blob_key FROM mutations WHERE namespace='history'",
     ).all();
@@ -550,7 +643,7 @@ describe('real D1/R2 API security', () => {
     ).toBe(403);
     await cleanup(env);
     await cleanup(env);
-    expect((await env.BLOBS.list()).objects).toHaveLength(0);
+    expect((await env.DB.prepare('SELECT key FROM blobs').all()).results).toHaveLength(0);
     expect((await env.DB.prepare('SELECT * FROM documents').all()).results).toHaveLength(0);
     const account = await env.DB.prepare('SELECT deleted_at FROM accounts WHERE subject=?')
       .bind('user_a')
@@ -589,7 +682,7 @@ describe('real D1/R2 API security', () => {
     );
     expect(invalid.status).toBe(400);
   });
-  it('streams encrypted exports and provides no-store, health and config', async () => {
+  it('pages encrypted exports and provides no-store, health and config', async () => {
     expect((await put('a')).status).toBe(200);
     const response = await request('/export');
     expect(response.headers.get('Cache-Control')).toBe('no-store');
@@ -618,7 +711,7 @@ describe('real D1/R2 API security', () => {
     expect((await request('/me')).status).toBe(401);
     expect((await env.DB.prepare('SELECT * FROM webhooks').all()).results).toHaveLength(1);
     await cleanup(env);
-    expect((await env.BLOBS.list()).objects).toHaveLength(0);
+    expect((await env.DB.prepare('SELECT key FROM blobs').all()).results).toHaveLength(0);
     expect((await send()).status).toBe(204);
     expect(
       (await env.DB.prepare("SELECT cleanup_pending FROM accounts WHERE subject='user_a'").first<{
@@ -698,10 +791,21 @@ describe('real D1/R2 API security', () => {
     expect(responses.map((r) => r.status)).toEqual(Array(6).fill(200));
     const values = await Promise.all(responses.map((r) => r.json()));
     expect(new Set(values.map((v) => JSON.stringify(v))).size).toBe(1);
-    expect((await put('a', 1)).status).toBe(200);
+    const next = { ...encrypted, ciphertext: encodeBase64url(new Uint8Array(16).fill(1)) };
+    expect((await put('a', 1, 'settings', { envelope: next })).status).toBe(200);
+    expect((await (await request('/documents/settings/a')).json()).envelope).toEqual(next);
     expect(await (await request('/documents/settings/a', 'PUT', input)).json()).toEqual(values[0]);
+    expect(
+      (
+        await request('/documents/settings/a', 'DELETE', {
+          expectedRevision: 2,
+          mutationId: crypto.randomUUID(),
+        })
+      ).status,
+    ).toBe(204);
     await cleanup(env);
-    expect((await env.BLOBS.list()).objects).toHaveLength(2);
+    expect((await env.DB.prepare('SELECT key FROM blobs').all()).results).toHaveLength(2);
+    expect(await (await request('/documents/settings/a', 'PUT', input)).json()).toEqual(values[0]);
   });
   it('serializes vault CAS and rejects unknown fields and wrapped-key version mismatches', async () => {
     const input = { expectedRevision: 1, mutationId: crypto.randomUUID(), vault };
@@ -736,14 +840,13 @@ describe('real D1/R2 API security', () => {
     await env.DB.batch([
       env.DB.prepare("UPDATE documents SET occurred_at=? WHERE namespace='history'").bind(old),
       env.DB.prepare("UPDATE mutations SET occurred_at=? WHERE namespace='history'").bind(old),
-      env.DB.prepare('UPDATE blobs SET occurred_at=? WHERE occurred_at IS NOT NULL').bind(old),
     ]);
     expect((await request('/documents/history/a')).status).toBe(410);
     expect((await (await request('/documents/history')).json()).documents).toEqual([]);
     expect((await (await request('/export')).json()).documents).toEqual([]);
     expect((await request('/documents/history/a', 'PUT', input)).status).toBe(410);
     await cleanup(env);
-    expect((await env.BLOBS.list()).objects).toHaveLength(0);
+    expect((await env.DB.prepare('SELECT key FROM blobs').all()).results).toHaveLength(0);
   });
   it('rejects account deletion with mismatched Clerk subject and drains more than 100 tombstones fairly', async () => {
     expect(
@@ -768,7 +871,7 @@ describe('real D1/R2 API security', () => {
       );
     }
     for (let i = 0; i < statements.length; i += 80) await env.DB.batch(statements.slice(i, i + 80));
-    for (let i = 0; i < 11; i++) await cleanup(env);
+    for (let i = 0; i < 105; i++) await cleanup(env);
     expect(
       (await env.DB.prepare("SELECT * FROM documents WHERE account_id LIKE 'dead_%'").all())
         .results,
@@ -786,25 +889,86 @@ describe('real D1/R2 API security', () => {
     );
     await env.DB.batch(statements.slice(0, 80));
     await env.DB.batch(statements.slice(80));
-    const exported = await (await request('/export')).json();
+    const first = await (await request('/export')).json();
+    expect(first.documents).toHaveLength(100);
+    expect(first.cursor).toBeTruthy();
+    const second = await (
+      await request(`/export?cursor=${encodeURIComponent(first.cursor)}`)
+    ).json();
+    expect(second.cursor).toBeNull();
+    expect(second.exportedAt).toBe(first.exportedAt);
+    const exported = { documents: [...first.documents, ...second.documents] };
     expect(exported.documents).toHaveLength(104);
     expect(new Set(exported.documents.map((d: { id: string }) => d.id)).size).toBe(104);
     expect(exported.documents[103].id).toBe('z102');
+    const continuation = `/export?cursor=${encodeURIComponent(first.cursor)}`;
+    expect(
+      (await request(`/documents/settings?cursor=${encodeURIComponent(first.cursor)}`)).status,
+    ).toBe(400);
+    expect((await request(`/export?cursor=${encodeURIComponent(first.cursor + 'x')}`)).status).toBe(
+      400,
+    );
+    const other = await own('account_b', client);
+    expect((await request(continuation, 'GET', undefined, other.access)).status).toBe(400);
+    await env.DB.prepare('UPDATE sessions SET client=? WHERE id=?')
+      .bind(JSON.stringify({ ...client, namespaces: ['settings'] }), browserSession.id)
+      .run();
+    expect((await request(continuation)).status).toBe(400);
+    await env.DB.prepare('UPDATE sessions SET client=? WHERE id=?')
+      .bind(JSON.stringify(client), browserSession.id)
+      .run();
+    await env.DB.prepare('UPDATE sessions SET revoked_at=? WHERE id=?')
+      .bind(Date.now(), browserSession.id)
+      .run();
+    expect((await request(continuation)).status).toBe(401);
   });
-  it('executes the actual scheduled worker and bulk-cleans expired pending uploads beyond 100 parameters', async () => {
+  it('fails closed for corrupt and foreign-owned payloads on read, replay, list and export', async () => {
+    const input = {
+      expectedRevision: 0,
+      mutationId: crypto.randomUUID(),
+      product: 'portfolio',
+      envelope: encrypted,
+    };
+    expect((await request('/documents/settings/a', 'PUT', input)).status).toBe(200);
+    await env.DB.prepare(
+      "INSERT INTO blobs(key,account_id,bytes,created_at,envelope) VALUES('corrupt','account_a',10,0,'{}')",
+    ).run();
+    await env.DB.batch([
+      env.DB.prepare("UPDATE documents SET blob_key='corrupt' WHERE id='a'"),
+      env.DB.prepare("UPDATE mutations SET blob_key='corrupt' WHERE document_id='a'"),
+    ]);
+    for (const path of ['/documents/settings/a', '/documents/settings', '/export'])
+      expect((await request(path)).status).toBe(500);
+    expect((await request('/documents/settings/a', 'PUT', input)).status).toBe(500);
+    await env.DB.prepare(
+      "INSERT INTO blobs(key,account_id,bytes,created_at,envelope) VALUES('foreign','account_b',10,0,?)",
+    )
+      .bind(JSON.stringify(encrypted))
+      .run();
+    await env.DB.batch([
+      env.DB.prepare("UPDATE documents SET blob_key='foreign' WHERE id='a'"),
+      env.DB.prepare("UPDATE mutations SET blob_key='foreign' WHERE document_id='a'"),
+    ]);
+    for (const path of ['/documents/settings/a', '/documents/settings', '/export'])
+      expect((await request(path)).status).toBe(500);
+    expect((await request('/documents/settings/a', 'PUT', input)).status).toBe(500);
+    await expect(
+      env.DB.prepare("UPDATE blobs SET envelope='{}' WHERE key='foreign'").run(),
+    ).rejects.toThrow('payload_immutable');
+  });
+  it('executes scheduled bounded SQL-only cleanup and makes repeated forward progress', async () => {
     const keys = Array.from({ length: 120 }, (_, i) => `account_a/abandoned_${i}`);
     const statements = keys.map((k) =>
       env.DB.prepare(
-        "INSERT INTO blobs(key,account_id,bytes,state,expires,created_at) VALUES(?,'account_a',100,'pending',0,0)",
-      ).bind(k),
+        "INSERT INTO blobs(key,account_id,bytes,created_at,envelope) VALUES(?,'account_a',100,0,?)",
+      ).bind(k, JSON.stringify(encrypted)),
     );
     await env.DB.batch(statements.slice(0, 80));
     await env.DB.batch(statements.slice(80));
-    for (let offset = 0; offset < keys.length; offset += 20)
-      await Promise.all(keys.slice(offset, offset + 20).map((k) => env.BLOBS.put(k, 'encrypted')));
     const response = await mf.dispatchFetch(ORIGIN + '/cdn-cgi/handler/scheduled');
     expect(response.status).toBe(200);
-    expect((await env.BLOBS.list()).objects).toHaveLength(0);
+    expect((await env.DB.prepare('SELECT key FROM blobs').all()).results).toHaveLength(104);
+    for (let i = 0; i < 7; i++) await cleanup(env);
     expect((await env.DB.prepare('SELECT * FROM blobs').all()).results).toHaveLength(0);
   });
   it('caps permanent delete receipts and vault responses atomically while preserving replay at the cap', async () => {
@@ -898,6 +1062,58 @@ describe('real D1/R2 API security', () => {
       cursor = page.cursor;
     } while (cursor);
     expect(ids).toEqual(['a', 'b', 'c', 'd', 'e']);
+    const exported: string[] = [];
+    cursor = null;
+    do {
+      const response = await request(
+        `/export${cursor ? '?cursor=' + encodeURIComponent(cursor) : ''}`,
+      );
+      const text = await response.text();
+      expect(new TextEncoder().encode(text).length).toBeLessThanOrEqual(2 * 1048576);
+      const page = JSON.parse(text);
+      expect(page.documents.length).toBeLessThanOrEqual(2);
+      exported.push(...page.documents.map((d: { id: string }) => d.id));
+      cursor = page.cursor;
+    } while (cursor);
+    expect(exported).toEqual(ids);
+  });
+  it('keeps cleanup below Free limits and independently preserves document- and receipt-referenced versions', async () => {
+    expect((await put('referenced')).status).toBe(200);
+    expect((await put('referenced', 1)).status).toBe(200);
+    await env.DB.prepare(
+      "UPDATE mutations SET blob_key=NULL WHERE document_id='referenced' AND blob_key=(SELECT blob_key FROM documents WHERE id='referenced')",
+    ).run();
+    await own('account_b', client);
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE accounts SET revocation_pending=1,session_epoch=session_epoch+1 WHERE id='account_a'",
+      ),
+      env.DB.prepare("UPDATE accounts SET deleted_at=1,cleanup_pending=1 WHERE id='account_b'"),
+      env.DB.prepare("UPDATE sessions SET idle_expires=0 WHERE account_id='account_a'"),
+    ]);
+    let count = 0;
+    const sql: string[] = [];
+    const tracked = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === 'prepare')
+          return (query: string) => {
+            count++;
+            sql.push(query);
+            return target.prepare(query);
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    await cleanup({ ...env, DB: tracked });
+    expect(count).toBe(26);
+    expect(sql.filter((query) => query.startsWith('DELETE FROM blobs'))).toHaveLength(4);
+    expect(
+      sql
+        .filter((query) => query.startsWith('DELETE FROM blobs'))
+        .every((query) => query.includes('LIMIT 4')),
+    ).toBe(true);
+    expect((await env.DB.prepare('SELECT key FROM blobs').all()).results).toHaveLength(2);
   });
   it('requires signed factor verification freshness and fresh enrolled MFA, not a refreshed iat', async () => {
     for (const fva of [null, [-1, -1], [6, -1], [0], [0.1, -1]]) {
@@ -1093,11 +1309,12 @@ describe('real D1/R2 API security', () => {
         'mutations_history',
       ],
       [
-        "SELECT key FROM blobs WHERE state='pending' AND expires<=0 ORDER BY expires LIMIT 1000",
-        'blobs_state_expiry',
+        'SELECT key FROM blobs WHERE NOT EXISTS(SELECT 1 FROM documents WHERE blob_key=blobs.key) AND NOT EXISTS(SELECT 1 FROM mutations WHERE blob_key=blobs.key) ORDER BY created_at,key LIMIT 4',
+        'blobs_cleanup',
       ],
       [
-        'SELECT id FROM accounts WHERE deleted_at IS NOT NULL AND cleanup_pending=1 ORDER BY deleted_at,id LIMIT 10',
+        `SELECT id FROM accounts WHERE deleted_at IS NOT NULL AND cleanup_pending=1
+        ORDER BY id<=COALESCE((SELECT cursor FROM cleanup_state WHERE id='accounts'),'') ,id LIMIT 1`,
         'accounts_cleanup',
       ],
     ];

@@ -159,6 +159,34 @@ export interface ExportResponse {
   vault: VaultResponse | null;
   documents: StoredDocument[];
 }
+export const exportPageSchema = z
+  .object({
+    version: z.literal(1),
+    accountId: idSchema,
+    exportedAt: z.string().datetime(),
+    vault: z
+      .object({ revision: z.number().int().nonnegative(), vault: vaultSchema })
+      .strict()
+      .nullable(),
+    documents: z
+      .array(
+        z
+          .object({
+            id: idSchema,
+            namespace: namespaceSchema,
+            product: productSchema,
+            revision: z.number().int().positive(),
+            envelope: encryptedEnvelopeSchema,
+            occurredAt: z.string().datetime().optional(),
+            updatedAt: z.string().datetime(),
+          })
+          .strict(),
+      )
+      .max(100),
+    cursor: z.string().min(1).max(1024).nullable(),
+  })
+  .strict();
+export type ExportPage = z.infer<typeof exportPageSchema>;
 export interface ConfigResponse {
   clerkPublishableKey: string;
   apiVersion: 1;

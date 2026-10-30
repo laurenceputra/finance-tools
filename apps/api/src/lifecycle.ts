@@ -124,7 +124,7 @@ lifecycle.post('/webhooks/clerk', async (c) => {
 export async function cleanup(env: Env, time = now()) {
   const cutoff = historyCutoff(time);
   // Each eligibility query uses an expiry/account index and a finite LIMIT.
-  // Transactions detach pointers before R2 deletion. Repeated invocations make
+  // Transactions detach pointers before payload deletion. Repeated invocations make
   // forward progress rather than attempting a whole-database expiration sweep.
   await env.DB.batch([
     env.DB.prepare(
@@ -135,14 +135,6 @@ export async function cleanup(env: Env, time = now()) {
       `UPDATE mutations SET response=NULL,blob_key=NULL,metadata_size=512 WHERE rowid IN
       (SELECT rowid FROM mutations WHERE namespace='history' AND (blob_key IS NOT NULL OR response IS NOT NULL) AND occurred_at<? ORDER BY occurred_at LIMIT 1000)`,
     ).bind(cutoff),
-    env.DB.prepare(
-      `UPDATE blobs SET state='deleting' WHERE key IN
-      (SELECT key FROM blobs WHERE occurred_at IS NOT NULL AND occurred_at<? AND state<>'deleting' ORDER BY occurred_at LIMIT 1000)`,
-    ).bind(cutoff),
-    env.DB.prepare(
-      `UPDATE blobs SET state='deleting' WHERE key IN
-      (SELECT key FROM blobs WHERE state='pending' AND expires<=? ORDER BY expires LIMIT 1000)`,
-    ).bind(time),
     env.DB.prepare(
       `UPDATE refresh_history SET successor=NULL WHERE hash IN
       (SELECT hash FROM refresh_history WHERE successor IS NOT NULL AND grace_until<=? ORDER BY grace_until LIMIT 1000)`,
@@ -169,9 +161,10 @@ export async function cleanup(env: Env, time = now()) {
     expired.results.map((row) => row.id),
   );
   const revocations = await env.DB.prepare(
-    'SELECT id,session_epoch FROM accounts WHERE revocation_pending=1 ORDER BY id LIMIT 10',
+    `SELECT id,session_epoch FROM accounts WHERE revocation_pending=1
+    ORDER BY id<=COALESCE((SELECT cursor FROM cleanup_state WHERE id='revocations'),'') ,id LIMIT 1`,
   ).all<{ id: string; session_epoch: number }>();
-  for (const account of revocations.results)
+  for (const account of revocations.results) {
     await env.DB.batch([
       env.DB.prepare(
         `UPDATE sessions SET revoked_at=? WHERE id IN(SELECT id FROM sessions WHERE account_id=? AND account_epoch<>? AND revoked_at IS NULL LIMIT 1000)`,
@@ -179,12 +172,17 @@ export async function cleanup(env: Env, time = now()) {
       env.DB.prepare(
         `UPDATE accounts SET revocation_pending=0 WHERE id=? AND NOT EXISTS(SELECT 1 FROM sessions WHERE account_id=accounts.id AND account_epoch<>accounts.session_epoch AND revoked_at IS NULL)`,
       ).bind(account.id),
+      env.DB.prepare(
+        "INSERT INTO cleanup_state(id,cursor) VALUES('revocations',?) ON CONFLICT(id) DO UPDATE SET cursor=excluded.cursor",
+      ).bind(account.id),
     ]);
-  // Bounded work per invocation. Bulk D1/R2 calls stay below D1's 1,000
-  // queries/invocation and 100 bound parameters/query limits. State is durable,
-  // so any R2 failure is safely retryable.
+  }
+  // At most 26 statements including both account queues and payload deletion,
+  // leaving headroom under the Workers Free 50-statement invocation limit.
+  // Durable round-robin cursors prevent a large account starving other accounts.
   const deleted = await env.DB.prepare(
-    `SELECT id FROM accounts WHERE deleted_at IS NOT NULL AND cleanup_pending=1 ORDER BY deleted_at,id LIMIT 10`,
+    `SELECT id FROM accounts WHERE deleted_at IS NOT NULL AND cleanup_pending=1
+    ORDER BY id<=COALESCE((SELECT cursor FROM cleanup_state WHERE id='accounts'),'') ,id LIMIT 1`,
   ).all<{ id: string }>();
   for (const account of deleted.results) {
     await env.DB.batch([
@@ -197,9 +195,6 @@ export async function cleanup(env: Env, time = now()) {
       env.DB.prepare(
         `DELETE FROM pairings WHERE id IN(SELECT id FROM pairings WHERE account_id=? LIMIT 1000)`,
       ).bind(account.id),
-      env.DB.prepare(
-        `UPDATE blobs SET state='deleting' WHERE key IN(SELECT key FROM blobs WHERE account_id=? AND state<>'deleting' LIMIT 1000)`,
-      ).bind(account.id),
     ]);
     const owned = await env.DB.prepare('SELECT id FROM sessions WHERE account_id=? LIMIT 100')
       .bind(account.id)
@@ -209,59 +204,30 @@ export async function cleanup(env: Env, time = now()) {
       owned.results.map((row) => row.id),
     );
     await env.DB.prepare(
-      `UPDATE accounts SET cleanup_pending=0 WHERE id=?
-      AND NOT EXISTS(SELECT 1 FROM mutations WHERE account_id=accounts.id) AND NOT EXISTS(SELECT 1 FROM documents WHERE account_id=accounts.id)
-      AND NOT EXISTS(SELECT 1 FROM pairings WHERE account_id=accounts.id) AND NOT EXISTS(SELECT 1 FROM sessions WHERE account_id=accounts.id)
-      AND NOT EXISTS(SELECT 1 FROM blobs WHERE account_id=accounts.id AND state<>'deleting')`,
+      "INSERT INTO cleanup_state(id,cursor) VALUES('accounts',?) ON CONFLICT(id) DO UPDATE SET cursor=excluded.cursor",
     )
       .bind(account.id)
       .run();
   }
-  const doomed = await env.DB.prepare(
-    `SELECT b.key FROM(SELECT key FROM blobs WHERE state='deleting' ORDER BY expires,key LIMIT 10000) b
-    WHERE NOT EXISTS(SELECT 1 FROM documents WHERE blob_key=b.key) AND NOT EXISTS(SELECT 1 FROM mutations WHERE blob_key=b.key)`,
-  ).all<{ key: string }>();
-  for (let offset = 0; offset < doomed.results.length; offset += 1000) {
-    const keys = doomed.results.slice(offset, offset + 1000).map((b) => b.key);
-    await env.BLOBS.delete(keys);
-    for (let index = 0; index < keys.length; index += 100) {
-      const chunk = keys.slice(index, index + 100);
-      await env.DB.prepare(
-        `DELETE FROM blobs WHERE key IN(${chunk.map(() => '?').join(',')}) AND state='deleting'
-        AND NOT EXISTS(SELECT 1 FROM documents WHERE blob_key=blobs.key) AND NOT EXISTS(SELECT 1 FROM mutations WHERE blob_key=blobs.key)`,
-      )
-        .bind(...chunk)
-        .run();
-    }
-  }
-  // A request might complete an R2 upload after its pending row was abandoned
-  // or its account was deleted. Inventory catches even these late orphan puts.
-  const state = await env.DB.prepare("SELECT cursor FROM cleanup_state WHERE id='r2'").first<{
-    cursor: string | null;
-  }>();
-  let cursor = state?.cursor;
-  for (let sweep = 0; sweep < 20; sweep++) {
-    const page = await env.BLOBS.list({ limit: 1000, ...(cursor ? { cursor } : {}) });
-    const old = page.objects.filter((object) => object.uploaded.getTime() <= time - 86400000),
-      orphans: string[] = [];
-    for (let index = 0; index < old.length; index += 100) {
-      const keys = old.slice(index, index + 100).map((o) => o.key);
-      const rows = await env.DB.prepare(
-        `SELECT key,state FROM blobs WHERE key IN(${keys.map(() => '?').join(',')})`,
-      )
-        .bind(...keys)
-        .all<{ key: string; state: string }>();
-      const live = new Set(rows.results.filter((r) => r.state !== 'deleting').map((r) => r.key));
-      orphans.push(...keys.filter((k) => !live.has(k)));
-    }
-    if (orphans.length) await env.BLOBS.delete(orphans);
-    cursor = page.truncated ? page.cursor : null;
+  // Small physical batches bound writes of potentially 1.4MB envelopes. SQL
+  // rechecks both references atomically; cleanup can never delete a replay version.
+  for (let batch = 0; batch < 4; batch++) {
     await env.DB.prepare(
-      "INSERT INTO cleanup_state(id,cursor) VALUES('r2',?) ON CONFLICT(id) DO UPDATE SET cursor=excluded.cursor",
+      `DELETE FROM blobs WHERE key IN(SELECT key FROM blobs
+      WHERE NOT EXISTS(SELECT 1 FROM documents WHERE blob_key=blobs.key)
+      AND NOT EXISTS(SELECT 1 FROM mutations WHERE blob_key=blobs.key)
+      ORDER BY created_at,key LIMIT 4)`,
+    ).run();
+  }
+  for (const account of deleted.results) {
+    await env.DB.prepare(
+      `UPDATE accounts SET cleanup_pending=0 WHERE id=?
+      AND NOT EXISTS(SELECT 1 FROM mutations WHERE account_id=accounts.id) AND NOT EXISTS(SELECT 1 FROM documents WHERE account_id=accounts.id)
+      AND NOT EXISTS(SELECT 1 FROM pairings WHERE account_id=accounts.id) AND NOT EXISTS(SELECT 1 FROM sessions WHERE account_id=accounts.id)
+      AND NOT EXISTS(SELECT 1 FROM blobs WHERE account_id=accounts.id)`,
     )
-      .bind(cursor)
+      .bind(account.id)
       .run();
-    if (!page.truncated) break;
   }
 }
 

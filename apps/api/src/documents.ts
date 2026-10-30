@@ -4,6 +4,7 @@ import { decodeBase64url, encodeBase64url } from '@finance-tools/crypto';
 import {
   documentDeleteRequestSchema,
   documentPutRequestSchema,
+  encryptedEnvelopeSchema,
   idSchema,
   namespaceSchema,
   productSchema,
@@ -61,18 +62,38 @@ function paths(c: Ctx) {
   scope(c, namespace.data);
   return { namespace: namespace.data, id: id.data };
 }
-async function stored(c: Ctx, row: Row): Promise<StoredDocument> {
+function payload(value: string | null | undefined): EncryptedEnvelope {
+  try {
+    const parsed = encryptedEnvelopeSchema.parse(JSON.parse(value ?? 'null'));
+    envelope(parsed);
+    return parsed;
+  } catch {
+    return fail(500, 'storage_unavailable');
+  }
+}
+async function loadPayloads(c: Ctx, keys: string[]) {
+  const rows = await c.env.DB.prepare(
+    'SELECT key,envelope FROM blobs WHERE account_id=? AND key IN(SELECT value FROM json_each(?))',
+  )
+    .bind(c.get('session').account_id, JSON.stringify(keys))
+    .all<{ key: string; envelope: string | null }>();
+  return new Map(rows.results.map((row) => [row.key, row.envelope]));
+}
+async function stored(
+  c: Ctx,
+  row: Row,
+  loaded?: Map<string, string | null>,
+): Promise<StoredDocument> {
   if (!row.blob_key) fail(404, 'not_found');
   if (row.namespace === 'history' && (!row.occurred_at || row.occurred_at < historyCutoff()))
     fail(410, 'history_expired');
-  const object = await c.env.BLOBS.get(row.blob_key);
-  if (!object) fail(500, 'storage_unavailable');
+  const values = loaded ?? (await loadPayloads(c, [row.blob_key]));
   return {
     id: row.id,
     namespace: row.namespace,
     product: row.product,
     revision: row.revision,
-    envelope: JSON.parse(await object.text()) as EncryptedEnvelope,
+    envelope: payload(values.get(row.blob_key)),
     updatedAt: row.updated_at,
     ...(row.occurred_at ? { occurredAt: row.occurred_at } : {}),
   };
@@ -96,9 +117,8 @@ async function replay(c: Ctx, found: Receipt, payloadHash: string, namespace: st
   if (!found.response) fail(410, 'history_expired');
   const response = JSON.parse(found.response);
   if (found.blob_key) {
-    const object = await c.env.BLOBS.get(found.blob_key);
-    if (!object) fail(500, 'storage_unavailable');
-    response.envelope = JSON.parse(await object.text());
+    const values = await loadPayloads(c, [found.blob_key]);
+    response.envelope = payload(values.get(found.blob_key));
   }
   return c.json(response);
 }
@@ -110,6 +130,7 @@ interface Command {
   payloadHash: string;
   expected: number;
   blob?: string;
+  envelope?: EncryptedEnvelope;
   occurredAt?: string;
   response?: string;
   vault?: string;
@@ -120,8 +141,8 @@ async function command(c: Ctx, input: Command) {
   const s = c.get('session');
   try {
     await c.env.DB.prepare(
-      `INSERT INTO commands(id,account_id,session_id,namespace,product,document_id,mutation_id,hash,expected,blob_key,occurred_at,response,vault,key_version,now,updated_at,cutoff)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      `INSERT INTO commands(id,account_id,session_id,namespace,product,document_id,mutation_id,hash,expected,blob_key,envelope,occurred_at,response,vault,key_version,now,updated_at,cutoff)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     )
       .bind(
         random(24),
@@ -134,6 +155,7 @@ async function command(c: Ctx, input: Command) {
         input.payloadHash,
         input.expected,
         input.blob ?? null,
+        input.envelope ? JSON.stringify(input.envelope) : null,
         input.occurredAt ?? null,
         input.response ?? null,
         input.vault ?? null,
@@ -147,6 +169,8 @@ async function command(c: Ctx, input: Command) {
     const message = error instanceof Error ? error.message : '';
     if (message.includes('inactive')) fail(401, 'unauthorized');
     if (message.includes('product_scope')) fail(403, 'product_scope');
+    if (message.includes('namespace_scope')) fail(403, 'scope');
+    if (message.includes('browser_required')) fail(403, 'browser_required');
     if (message.includes('expired_history')) fail(410, 'history_expired');
     if (message.includes('metadata_quota')) fail(413, 'metadata_quota_exceeded');
     if (message.includes('quota')) fail(413, 'quota_exceeded');
@@ -240,7 +264,6 @@ documents.put('/documents/:namespace/:id', async (c) => {
   const found = await receipt(c, namespace, id, input.mutationId);
   if (found) return replay(c, found, payloadHash, namespace);
   envelope(input.envelope);
-  const size = new TextEncoder().encode(JSON.stringify(input.envelope)).length;
   if ((namespace === 'history') !== !!input.occurredAt)
     fail(400, 'occurred_at_required_for_history_only');
   const occurredAt = input.occurredAt ? new Date(input.occurredAt).toISOString() : undefined;
@@ -249,67 +272,28 @@ documents.put('/documents/:namespace/:id', async (c) => {
   const blob = `${s.account_id}/${random(32)}`,
     time = now(),
     updatedAt = iso(time);
-  // Register before uploading. Cleanup first marks expired pending keys deleting;
-  // the commit trigger refuses those keys. Object keys are never reused.
-  const pending = await c.env.DB.prepare(
-    `INSERT INTO blobs(key,account_id,bytes,state,expires,occurred_at,created_at)
-    SELECT ?,?,?,'pending',?,?,? WHERE EXISTS(SELECT 1 FROM accounts WHERE id=? AND deleted_at IS NULL AND disabled_at IS NULL)
-    AND EXISTS(SELECT 1 FROM sessions WHERE id=? AND account_id=? AND account_epoch=(SELECT session_epoch FROM accounts WHERE id=?)
-      AND revoked_at IS NULL AND idle_expires>? AND absolute_expires>?)
-    AND (SELECT COALESCE(SUM(bytes),0) FROM blobs WHERE account_id=?)+? <= (SELECT max_bytes FROM accounts WHERE id=?)`,
-  )
-    .bind(
-      blob,
-      s.account_id,
-      size,
-      time + 3600000,
-      occurredAt ?? null,
-      time,
-      s.account_id,
-      s.id,
-      s.account_id,
-      s.account_id,
-      time,
-      time,
-      s.account_id,
-      size,
-      s.account_id,
-    )
-    .run();
-  if (!pending.meta.changes) fail(413, 'quota_exceeded');
-  try {
-    const uploaded = await c.env.BLOBS.put(blob, JSON.stringify(input.envelope), {
-      onlyIf: { etagDoesNotMatch: '*' },
-      httpMetadata: { contentType: 'application/json' },
-    });
-    if (!uploaded) fail(500, 'storage_unavailable');
-    const response = {
-      id,
-      namespace,
-      product: input.product,
-      revision: input.expectedRevision + 1,
-      updatedAt,
-      ...(occurredAt ? { occurredAt } : {}),
-    };
-    return await command(c, {
-      namespace,
-      product: input.product,
-      id,
-      mutation: input.mutationId,
-      payloadHash,
-      expected: input.expectedRevision,
-      blob,
-      occurredAt,
-      keyVersion: input.envelope.keyVersion,
-      response: JSON.stringify(response),
-      updatedAt,
-    });
-  } finally {
-    // A failed CAS/replayed concurrent mutation must not leave its upload live.
-    await c.env.DB.prepare("UPDATE blobs SET state='deleting' WHERE key=? AND state='pending'")
-      .bind(blob)
-      .run();
-  }
+  const response = {
+    id,
+    namespace,
+    product: input.product,
+    revision: input.expectedRevision + 1,
+    updatedAt,
+    ...(occurredAt ? { occurredAt } : {}),
+  };
+  return command(c, {
+    namespace,
+    product: input.product,
+    id,
+    mutation: input.mutationId,
+    payloadHash,
+    expected: input.expectedRevision,
+    blob,
+    envelope: input.envelope,
+    occurredAt,
+    keyVersion: input.envelope.keyVersion,
+    response: JSON.stringify(response),
+    updatedAt,
+  });
 });
 documents.delete('/documents/:namespace/:id', async (c) => {
   await authenticate(c);
@@ -337,6 +321,7 @@ documents.delete('/documents/:namespace/:id', async (c) => {
   });
 });
 
+const exportPositionSchema = z.tuple([namespaceSchema, idSchema, z.string().datetime()]);
 async function cursor(c: Ctx, namespace: string, after: string, grants: Product[]) {
   const value = JSON.stringify({
     a: c.get('session').account_id,
@@ -374,7 +359,10 @@ async function afterCursor(c: Ctx, namespace: string, grants: Product[], value?:
       payload.a !== c.get('session').account_id ||
       payload.n !== namespace ||
       JSON.stringify(payload.p) !== JSON.stringify(grants) ||
-      !idSchema.safeParse(payload.i).success
+      !(namespace.startsWith('export:')
+        ? typeof payload.i === 'string' &&
+          exportPositionSchema.safeParse(JSON.parse(payload.i)).success
+        : idSchema.safeParse(payload.i).success)
     )
       throw new Error();
     return payload.i as string;
@@ -401,7 +389,7 @@ documents.get('/documents/:namespace', async (c) => {
   const grants = (query.data.product ? [query.data.product] : products(c)).slice().sort();
   const after = await afterCursor(c, namespace, grants, query.data.cursor);
   const rows = await c.env.DB.prepare(
-    `SELECT d.*,b.bytes FROM documents d JOIN blobs b ON b.key=d.blob_key WHERE d.account_id=? AND namespace=? AND id>? AND product IN(SELECT value FROM json_each(?)) AND blob_key IS NOT NULL AND (namespace<>'history' OR d.occurred_at>=?) ORDER BY id LIMIT ?`,
+    `SELECT d.*,COALESCE(b.bytes,0) AS bytes FROM documents d LEFT JOIN blobs b ON b.key=d.blob_key AND b.account_id=d.account_id WHERE d.account_id=? AND namespace=? AND id>? AND product IN(SELECT value FROM json_each(?)) AND blob_key IS NOT NULL AND (namespace<>'history' OR d.occurred_at>=?) ORDER BY id LIMIT ?`,
   )
     .bind(
       s.account_id,
@@ -421,7 +409,11 @@ documents.get('/documents/:namespace', async (c) => {
     bytes += cost;
   }
   const values = [];
-  for (const row of page) values.push(await stored(c, row));
+  const loaded = await loadPayloads(
+    c,
+    page.map((row) => row.blob_key!),
+  );
+  for (const row of page) values.push(await stored(c, row, loaded));
   return c.json({
     documents: values,
     cursor:
@@ -443,74 +435,57 @@ documents.get('/export', async (c) => {
   const vault: VaultResponse | null = account.vault
     ? { revision: account.vault_revision, vault: JSON.parse(account.vault) as Vault }
     : null;
-  const encoder = new TextEncoder();
-  // Pull-based streaming bounds memory to one envelope. Export is an encrypted
-  // read, not an atomic snapshot; concurrent edits may appear in later pages.
-  let afterNamespace = '',
-    afterId = '',
-    started = false,
-    finished = false;
-  let page: Row[] = [];
-  const stream = new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      try {
-        if (!started) {
-          controller.enqueue(
-            encoder.encode(
-              JSON.stringify({
-                version: 1,
-                accountId: s.account_id,
-                exportedAt: iso(),
-                vault,
-              }).slice(0, -1) + ',"documents":[',
-            ),
-          );
-          started = true;
-        }
-        if (!page.length) {
-          // Seek in the composite primary key, rather than issuing one D1 scan
-          // per object. Recheck authorization at each metadata page boundary.
-          const current = await c.env.DB.prepare(
-            `SELECT id FROM sessions WHERE id=? AND revoked_at IS NULL AND idle_expires>? AND absolute_expires>?
-          AND EXISTS(SELECT 1 FROM accounts WHERE id=sessions.account_id AND deleted_at IS NULL AND disabled_at IS NULL AND session_epoch=sessions.account_epoch)`,
-          )
-            .bind(s.id, now(), now())
-            .first();
-          if (!current) throw new Error('Session revoked');
-          const rows = await c.env.DB.prepare(
-            `SELECT * FROM documents WHERE account_id=? AND (namespace>? OR (namespace=? AND id>?))
-          AND product IN(SELECT value FROM json_each(?)) AND namespace IN(SELECT value FROM json_each(?))
-          AND blob_key IS NOT NULL AND (namespace<>'history' OR occurred_at>=?) ORDER BY namespace,id LIMIT 100`,
-          )
-            .bind(
-              s.account_id,
-              afterNamespace,
-              afterNamespace,
-              afterId,
-              JSON.stringify(grants.products),
-              JSON.stringify(grants.namespaces),
-              historyCutoff(),
-            )
-            .all<Row>();
-          page = rows.results;
-        }
-        const row = page.shift();
-        if (!row) {
-          controller.enqueue(encoder.encode(']}'));
-          controller.close();
-          return;
-        }
-        const value = await stored(c, row);
-        controller.enqueue(encoder.encode((finished ? ',' : '') + JSON.stringify(value)));
-        finished = true;
-        afterNamespace = row.namespace;
-        afterId = row.id;
-      } catch {
-        controller.error(new Error('Export interrupted'));
-      }
-    },
-  });
-  return new Response(stream, {
-    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
+  const query = z.object({ cursor: z.string().optional() }).strict().safeParse(c.req.query());
+  if (!query.success) fail(400, 'invalid_query');
+  const context = `export:${JSON.stringify(grants.namespaces.slice().sort())}`;
+  const allowed = grants.products.slice().sort();
+  const after = await afterCursor(c, context, allowed, query.data.cursor);
+  const position = after ? exportPositionSchema.parse(JSON.parse(after)) : null;
+  const afterNamespace = position?.[0] ?? '';
+  const afterId = position?.[1] ?? '';
+  const exportedAt = position?.[2] ?? iso();
+  // Metadata-only lookahead, followed by one ownership-scoped payload query.
+  // Export is not a snapshot: concurrent edits may appear on later pages.
+  const rows = await c.env.DB.prepare(
+    `SELECT d.*,COALESCE(b.bytes,0) AS bytes FROM documents d LEFT JOIN blobs b ON b.key=d.blob_key AND b.account_id=d.account_id
+    WHERE d.account_id=? AND (d.namespace>? OR (d.namespace=? AND d.id>?))
+    AND d.product IN(SELECT value FROM json_each(?)) AND d.namespace IN(SELECT value FROM json_each(?))
+    AND d.blob_key IS NOT NULL AND (d.namespace<>'history' OR d.occurred_at>=?) ORDER BY d.namespace,d.id LIMIT 101`,
+  )
+    .bind(
+      s.account_id,
+      afterNamespace,
+      afterNamespace,
+      afterId,
+      JSON.stringify(allowed),
+      JSON.stringify(grants.namespaces),
+      historyCutoff(),
+    )
+    .all<Row & { bytes: number }>();
+  const page: Row[] = [];
+  let bytes = 0;
+  for (const row of rows.results.slice(0, 100)) {
+    const cost = row.bytes + 512;
+    if (page.length && bytes + cost > 2 * 1048576) break;
+    page.push(row);
+    bytes += cost;
+  }
+  const loaded = await loadPayloads(
+    c,
+    page.map((row) => row.blob_key!),
+  );
+  const values = [];
+  for (const row of page) values.push(await stored(c, row, loaded));
+  const last = page[page.length - 1];
+  return c.json({
+    version: 1,
+    accountId: s.account_id,
+    exportedAt,
+    vault,
+    documents: values,
+    cursor:
+      rows.results.length > page.length
+        ? await cursor(c, context, JSON.stringify([last.namespace, last.id, exportedAt]), allowed)
+        : null,
   });
 });
