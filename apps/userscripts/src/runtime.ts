@@ -769,7 +769,7 @@ export function runtime(name: string) {
     status.setAttribute('role', 'status');
     text(
       'p',
-      'Pairing grants encrypted sync only. Vault credentials stay in this script, never in the page bridge. Captures are incomplete and may be stale.',
+      'Pairing grants scoped sync. Standard mode releases the server-recoverable key after pairing. Private mode requires your key file or vault credentials; never share them with the page bridge. Captures may be incomplete or stale.',
     );
     const vaultLink = text(
       'a',
@@ -803,6 +803,11 @@ export function runtime(name: string) {
       if (!pairing) throw new Error('Create a pairing first');
       await client.redeem(pairing.pairingId, pairing.secret);
       pairing = undefined;
+      if (client.unlocked) {
+        await loadSettings();
+        for (const listener of unlockListeners) listener();
+        render();
+      }
     });
     const credential = text('input', '') as HTMLInputElement;
     credential.type = 'password';
@@ -819,6 +824,27 @@ export function runtime(name: string) {
     const remember = document.createElement('input');
     remember.type = 'checkbox';
     rememberLabel.append(remember);
+    const keyLabel = text('label', 'Private key / legacy recovery file');
+    const keyFile = document.createElement('input');
+    keyFile.type = 'file';
+    keyFile.accept = 'application/json';
+    keyLabel.append(keyFile);
+    keyFile.onchange = () => {
+      const file = keyFile.files?.[0];
+      keyFile.value = '';
+      if (file)
+        void run(async () => {
+          if (!client.me) await client.initialize();
+          if (file.size > 8192) throw new Error('Key file limit is 8 KiB');
+          const epoch = client.lockEpoch,
+            input: unknown = JSON.parse(await file.text());
+          if (epoch !== client.lockEpoch) return;
+          await client.unlockKeyFile(input, remember.checked);
+          await loadSettings();
+          for (const listener of unlockListeners) listener();
+          render();
+        });
+    };
     button('Unlock', async () => {
       if (!client.me) await client.initialize();
       const secret = credential.value;

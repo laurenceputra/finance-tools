@@ -10,6 +10,16 @@ let factors: Factor[] = [],
   secondVerified = false,
   pendingSecond: (() => void) | undefined,
   delaySecond = false;
+let delayToken = false,
+  pendingToken: (() => void) | undefined;
+export function configureTokenDelay(value: boolean) {
+  delayToken = value;
+}
+export function resolveToken() {
+  pendingToken?.();
+  pendingToken = undefined;
+  delayToken = false;
+}
 const verificationCalls: string[] = [];
 export function configureVerification(
   strategy: 'totp' | 'backup_code' | 'phone_code' | 'none',
@@ -32,6 +42,7 @@ export const verificationState = () => ({
   firstVerified,
   secondVerified,
   pending: !!pendingSecond,
+  pendingToken: !!pendingToken,
 });
 export const resolveSecond = () => {
   pendingSecond?.();
@@ -62,6 +73,10 @@ export function useAuth() {
     userId,
     getToken: async () => {
       verificationCalls.push('token');
+      if (delayToken)
+        await new Promise<void>((resolve) => {
+          pendingToken = resolve;
+        });
       return userId
         ? `e30.${btoa(JSON.stringify({ sub: userId, sid: `clerk-${userId}`, fva: [firstVerified ? 0 : -1, secondVerified ? 0 : -1] })).replace(/=/g, '')}.signature`
         : null;

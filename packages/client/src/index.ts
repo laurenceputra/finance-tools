@@ -8,6 +8,7 @@ import type {
   SessionTokens,
   StoredDocument,
   VaultResponse,
+  PrivateVault,
 } from '@finance-tools/contracts';
 import {
   documentPutRequestSchema,
@@ -16,7 +17,10 @@ import {
   idSchema,
   namespaceSchema,
   productSchema,
-  vaultSchema,
+  isStandardVault,
+  keyFileSchema,
+  legacyRecoveryFileSchema,
+  vaultMetadataSchema,
 } from '@finance-tools/contracts';
 import {
   createVault,
@@ -26,6 +30,10 @@ import {
   recoverVault,
   rewrapVaultPassphrase,
   unlockVault,
+  importVaultKey,
+  encodeBase64url,
+  unwrapVaultKey,
+  wrapVaultKey,
 } from '@finance-tools/crypto';
 import { validateJson, validateProductDocument } from './data';
 import { timestampSchema } from '@finance-tools/portfolio-domain';
@@ -190,12 +198,26 @@ export function mergeSnapshots(remote: unknown, local: unknown): unknown {
     provenance: { ...remote.provenance, complete: false, flags },
   };
 }
+interface ModeChange {
+  mutationId: string;
+  expectedRevision: number;
+  vault: VaultResponse['vault'];
+  rawKey?: string;
+  trustServer?: true;
+}
 export class FinanceClient {
   private access?: string;
   private tokenAccountId?: string;
   private refreshFlight?: Promise<void>;
   private generation = 0;
   private key?: CryptoKey;
+  private autoUnlockAllowed = true;
+  private pendingMode?: {
+    accountId: string;
+    generation: number;
+    sourceVault: PrivateVault;
+    input: ModeChange;
+  };
   private storageFlight: Promise<unknown> = Promise.resolve();
   me?: MeResponse;
   vault?: VaultResponse;
@@ -315,9 +337,11 @@ export class FinanceClient {
     this.me = undefined;
     this.vault = undefined;
     this.key = undefined;
+    this.pendingMode = undefined;
+    this.autoUnlockAllowed = false;
     this.onLock(false);
   }
-  async exchange(clerkToken: string) {
+  async exchange(clerkToken: string, assertIdentity: (me: MeResponse) => void = () => {}) {
     const locking = this.lock(),
       epoch = this.generation;
     await locking;
@@ -340,7 +364,8 @@ export class FinanceClient {
       });
       await this.accept(tokens, epoch, fence);
     });
-    await this.initialize();
+    this.autoUnlockAllowed = true;
+    await this.initialize(assertIdentity);
   }
   async redeem(pairingId: string, secret: string) {
     const locking = this.lock(),
@@ -360,6 +385,7 @@ export class FinanceClient {
         fence,
       );
     });
+    this.autoUnlockAllowed = true;
     await this.initialize();
   }
   async refresh() {
@@ -414,25 +440,37 @@ export class FinanceClient {
     }
     return this.refreshFlight;
   }
-  async request<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
+  async request<T>(
+    path: string,
+    method = 'GET',
+    body?: unknown,
+    assertCurrent: () => void = () => {},
+  ): Promise<T> {
     const epoch = this.generation;
+    // Keep sensitive-action intent checks live across renewal, including 401 retries.
+    // The callback is transient and never enters a durable mutation payload.
+    const check = () => {
+      this.guard(epoch);
+      assertCurrent();
+    };
+    check();
     if (!this.access) await this.refresh();
-    this.guard(epoch);
+    check();
     try {
       const result = await this.raw<T>(path, method, body, this.access);
-      this.guard(epoch);
+      check();
       return result;
     } catch (error) {
-      this.guard(epoch);
+      check();
       if (!(error instanceof ApiFailure) || error.status !== 401) throw error;
       await this.refresh();
-      this.guard(epoch);
+      check();
       const result = await this.raw<T>(path, method, body, this.access);
-      this.guard(epoch);
+      check();
       return result;
     }
   }
-  async initialize() {
+  async initialize(assertIdentity: (me: MeResponse) => void = () => {}) {
     const epoch = this.generation;
     await this.purgeLocalHistory();
     this.guard(epoch);
@@ -442,6 +480,15 @@ export class FinanceClient {
       this.abandonAccount();
       throw new Error('Session identity does not match account metadata');
     }
+    const checkIdentity = () => {
+      try {
+        assertIdentity(me);
+      } catch (error) {
+        this.abandonAccount();
+        throw error;
+      }
+    };
+    checkIdentity();
     let vault: VaultResponse | undefined;
     try {
       vault = await this.request<VaultResponse>('/vault');
@@ -454,12 +501,22 @@ export class FinanceClient {
       keyVersion: number;
       key?: CryptoKey;
       recoverySecret?: string;
+      revision?: number;
     }>('remembered');
     this.guard(epoch);
+    checkIdentity();
     let rememberedKey: CryptoKey | undefined;
-    if (saved && saved.accountId === me.accountId && saved.keyVersion === vault?.vault.keyVersion) {
+    if (
+      saved &&
+      vault &&
+      !isStandardVault(vault.vault) &&
+      (saved.revision === vault.revision ||
+        (saved.revision === undefined && vault.vault.version === 1)) &&
+      saved.accountId === me.accountId &&
+      saved.keyVersion === vault.vault.keyVersion
+    ) {
       if (saved.key instanceof CryptoKey) rememberedKey = saved.key;
-      else if (saved.recoverySecret && this.kind === 'userscript' && vault)
+      else if (saved.recoverySecret && this.kind === 'userscript')
         rememberedKey = await recoverVault(me.accountId, vault.vault, saved.recoverySecret);
     } else if (saved)
       await this.stored(
@@ -467,17 +524,31 @@ export class FinanceClient {
         () => this.guard(epoch),
       );
     this.guard(epoch);
+    checkIdentity();
     if (
       (this.me && this.me.accountId !== me.accountId) ||
-      (this.vault && this.vault.vault.keyVersion !== vault?.vault.keyVersion)
+      (this.vault &&
+        (this.vault.revision !== vault?.revision ||
+          canonical(this.vault.vault) !== canonical(vault?.vault ?? null)))
     ) {
       this.generation++;
       this.key = undefined;
+      rememberedKey = undefined;
+      this.autoUnlockAllowed = false;
+      this.pendingMode = undefined;
       this.onLock();
+      const changedEpoch = this.generation;
+      await this.stored(
+        () => this.storage.delete('remembered'),
+        () => this.guard(changedEpoch),
+      );
     }
     this.me = me;
     this.vault = vault;
     if (rememberedKey) this.key = rememberedKey;
+    if (vault && isStandardVault(vault.vault) && this.autoUnlockAllowed)
+      await this.unlockStandard();
+    checkIdentity();
   }
   get unlocked() {
     return !!this.key;
@@ -514,6 +585,8 @@ export class FinanceClient {
     fence();
     this.generation++;
     this.key = undefined;
+    this.autoUnlockAllowed = false;
+    this.pendingMode = undefined;
     this.onLock();
     await this.stored(() => this.storage.delete('remembered'), fence);
   }
@@ -585,26 +658,42 @@ export class FinanceClient {
       account = this.account();
     const vault = await this.request<VaultResponse>('/vault');
     this.guard(epoch, account);
-    if (this.vault && this.vault.vault.keyVersion !== vault.vault.keyVersion) {
+    if (
+      this.vault &&
+      (this.vault.revision !== vault.revision ||
+        this.vault.vault.keyVersion !== vault.vault.keyVersion ||
+        canonical(this.vault.vault) !== canonical(vault.vault))
+    ) {
       const locking = this.lock(),
         changedEpoch = this.generation;
       await locking;
       this.guard(changedEpoch, account);
       this.vault = vault;
-      throw new Error('Vault key version changed. Old keys/views were cleared; unlock again.');
+      throw new Error(
+        'Vault mode or key version changed. Old keys/views were cleared; unlock again.',
+      );
     }
     this.vault = vault;
     return vault;
   }
   async unlock(credential: string, recovery = false, remember = false) {
-    if (remember && this.kind === 'userscript' && !recovery)
-      throw new Error('Script remember requires recovery-key unlock (GM cannot persist CryptoKey)');
     const generation = this.generation,
       account = this.account(),
       { vault } = await this.loadVault();
-    const key = await (recovery
-      ? recoverVault(account, vault, credential)
-      : unlockVault(account, vault, credential));
+    if (isStandardVault(vault)) return this.unlockStandard();
+    if (remember && this.kind === 'userscript' && !recovery)
+      throw new Error('Script remember requires recovery-key unlock (GM cannot persist CryptoKey)');
+    let key: CryptoKey;
+    try {
+      key = await (recovery
+        ? recoverVault(account, vault, credential)
+        : unlockVault(account, vault, credential));
+    } catch {
+      this.guard(generation, account);
+      throw new Error(
+        'Could not unlock this Private vault. Check the passphrase or use the matching account key/recovery file.',
+      );
+    }
     if (generation !== this.generation || account !== this.me?.accountId)
       throw new Error('Account changed or vault locked');
     this.key = key;
@@ -614,11 +703,219 @@ export class FinanceClient {
           this.storage.set('remembered', {
             accountId: account,
             keyVersion: vault.keyVersion,
+            revision: this.vault?.revision,
             ...(this.kind === 'userscript' ? { recoverySecret: credential } : { key }),
           }),
         () => this.guard(generation, account),
       );
     }
+  }
+  private async standardRawKey(revision: number) {
+    const epoch = this.generation,
+      account = this.account();
+    const released = await this.request<{ revision: number; keyVersion: number; rawKey: string }>(
+      '/vault/key',
+      'POST',
+      { expectedRevision: revision },
+    );
+    this.guard(epoch, account);
+    if (released.revision !== revision || released.keyVersion !== this.vault?.vault.keyVersion)
+      throw new Error('Vault changed while releasing key');
+    const raw = decodeBase64url(released.rawKey);
+    if (raw.length !== 32) throw new Error('Invalid vault key response');
+    return raw;
+  }
+  async unlockStandard() {
+    const epoch = this.generation,
+      account = this.account(),
+      current = this.vault;
+    if (!current || !isStandardVault(current.vault))
+      throw new Error(
+        'Private mode: import your key file or unlock with your passphrase/recovery secret',
+      );
+    const raw = await this.standardRawKey(current.revision);
+    try {
+      const key = await importVaultKey(raw);
+      this.guard(epoch, account);
+      this.key = key;
+    } finally {
+      raw.fill(0);
+    }
+  }
+  async unlockKeyFile(input: unknown, remember = false) {
+    const file = keyFileSchema.safeParse(input);
+    const legacy = legacyRecoveryFileSchema.safeParse(input);
+    if (!file.success && !legacy.success)
+      throw new Error(
+        'Unsupported key file. Choose a Finance Private key file or legacy recovery JSON file, not an encrypted backup.',
+      );
+    const value = file.success ? file.data : legacy.data!;
+    if (
+      value.accountId !== this.account() ||
+      ('keyVersion' in value && value.keyVersion !== this.vault?.vault.keyVersion)
+    )
+      throw new Error('Key file belongs to a different account or key version');
+    await this.unlock(value.recoverySecret, true, remember);
+  }
+  async preparePrivate(passphrase: string, keyFile?: unknown) {
+    const epoch = this.generation,
+      accountId = this.account(),
+      current = await this.loadVault();
+    if (!isStandardVault(current.vault)) throw new Error('Already in Private mode');
+    if (passphrase.length < 12) throw new Error('Use a passphrase of at least 12 characters');
+    const imported = keyFile === undefined ? undefined : keyFileSchema.parse(keyFile);
+    if (
+      imported &&
+      (imported.accountId !== accountId || imported.keyVersion !== current.vault.keyVersion)
+    )
+      throw new Error('Key file belongs to a different account or key version');
+    const raw = await this.standardRawKey(current.revision);
+    try {
+      const prepared = await wrapVaultKey(
+        accountId,
+        raw,
+        passphrase,
+        current.vault.keyVersion,
+        imported?.recoverySecret,
+      );
+      // Local unlock test before any server metadata is changed.
+      const test = await recoverVault(accountId, prepared.vault, prepared.recoverySecret);
+      const context = {
+        accountId,
+        namespace: 'vault',
+        documentId: 'continuity',
+        schemaVersion: 1 as const,
+        keyVersion: current.vault.keyVersion,
+      };
+      await decryptJson(
+        test,
+        await encryptJson(await importVaultKey(raw), 'continuity', context),
+        context,
+      );
+      this.guard(epoch, accountId);
+      return {
+        accountId,
+        epoch,
+        revision: current.revision,
+        mutationId: crypto.randomUUID(),
+        vault: { ...prepared.vault, version: 2 as const, mode: 'private' as const },
+        keyFile: keyFileSchema.parse({
+          format: 'finance-tools-key',
+          version: 2,
+          accountId,
+          keyVersion: current.vault.keyVersion,
+          recoverySecret: prepared.recoverySecret,
+        }),
+      };
+    } finally {
+      raw.fill(0);
+    }
+  }
+  async finishPrivate(
+    prepared: Awaited<ReturnType<FinanceClient['preparePrivate']>>,
+    clerkToken: string,
+    assertCurrent: () => void = () => {},
+  ) {
+    this.guard(prepared.epoch, prepared.accountId);
+    await this.commitMode(
+      {
+        mutationId: prepared.mutationId,
+        expectedRevision: prepared.revision,
+        vault: prepared.vault,
+      },
+      clerkToken,
+      assertCurrent,
+    );
+  }
+  async enableStandard(
+    credential: string,
+    recovery: boolean,
+    clerkToken: string,
+    trustServer: boolean,
+    assertCurrent: () => void = () => {},
+  ) {
+    if (!trustServer) throw new Error('Explicit consent to server recovery is required');
+    if (!this.unlocked) throw new Error('Unlock your Private vault first');
+    const epoch = this.generation,
+      account = this.account();
+    assertCurrent();
+    if (this.pendingMode) {
+      this.guard(this.pendingMode.generation, this.pendingMode.accountId);
+      const pending = this.pendingMode;
+      const raw = await unwrapVaultKey(account, pending.sourceVault, credential, recovery);
+      try {
+        this.guard(epoch, account);
+        assertCurrent();
+        if (encodeBase64url(raw) !== pending.input.rawKey)
+          throw new Error('Mode-change credential no longer matches this intent');
+      } finally {
+        raw.fill(0);
+      }
+      const current = await this.request<VaultResponse>('/vault');
+      this.guard(epoch, account);
+      assertCurrent();
+      if (
+        !(
+          (current.revision === pending.input.expectedRevision &&
+            canonical(current.vault) === canonical(pending.sourceVault)) ||
+          (current.revision === pending.input.expectedRevision + 1 &&
+            canonical(current.vault) === canonical(pending.input.vault))
+        )
+      )
+        throw new Error('Vault changed. Lock and start the mode change again.');
+    }
+    if (!this.pendingMode) {
+      const current = await this.loadVault();
+      if (isStandardVault(current.vault)) throw new Error('Already in Standard mode');
+      const raw = await unwrapVaultKey(account, current.vault, credential, recovery);
+      try {
+        this.guard(epoch, account);
+        assertCurrent();
+        this.pendingMode = {
+          accountId: account,
+          generation: epoch,
+          sourceVault: current.vault,
+          input: {
+            mutationId: crypto.randomUUID(),
+            expectedRevision: current.revision,
+            vault: { version: 2, mode: 'standard', keyVersion: current.vault.keyVersion },
+            rawKey: encodeBase64url(raw),
+            trustServer: true,
+          },
+        };
+      } finally {
+        raw.fill(0);
+      }
+    }
+    this.guard(this.pendingMode.generation, this.pendingMode.accountId);
+    await this.commitMode(this.pendingMode.input, clerkToken, assertCurrent);
+  }
+  private async commitMode(
+    input: ModeChange,
+    clerkToken: string,
+    assertCurrent: () => void = () => {},
+  ) {
+    const epoch = this.generation,
+      account = this.account();
+    // Never use mutation(): its durable queue must not contain raw keys or Clerk tokens.
+    assertCurrent();
+    const result = await this.request<VaultResponse>(
+      '/vault/mode',
+      'PUT',
+      {
+        ...input,
+        clerkToken,
+      },
+      assertCurrent,
+    );
+    this.guard(epoch, account);
+    const metadata = vaultMetadataSchema.parse(result.vault);
+    const locking = this.lock(),
+      changedEpoch = this.generation;
+    await locking;
+    this.guard(changedEpoch, account);
+    this.vault = { revision: result.revision, vault: metadata };
+    // Deliberately remain locked after a security-mode change; discard stale views and remembered keys.
   }
   async prepareVault(passphrase: string) {
     const accountId = this.account(),
@@ -645,6 +942,8 @@ export class FinanceClient {
       account = this.account(),
       check = () => this.guard(epoch, account);
     const current = await this.loadVault();
+    if (isStandardVault(current.vault))
+      throw new Error('Standard mode does not use a vault passphrase');
     check();
     const queueKey = `mutation:${account}:/vault`;
     const pending = await this.storage.get<{
@@ -653,6 +952,7 @@ export class FinanceClient {
     check();
     if (
       pending &&
+      !isStandardVault(pending.body.vault) &&
       pending.body.vault.keyVersion === current.vault.keyVersion &&
       canonical(pending.body.vault.recoveryEnvelope) === canonical(current.vault.recoveryEnvelope)
     ) {
@@ -890,7 +1190,7 @@ export class FinanceClient {
       return this.put(namespace, id, merged, remote.revision, occurredAt, undefined, product);
     }
   }
-  async encryptedExport() {
+  async encryptedExport(passphrase?: string) {
     const epoch = this.generation,
       accountId = this.account();
     const seen = new Set<string>();
@@ -921,6 +1221,23 @@ export class FinanceClient {
         seen.add(cursor);
       }
     } while (cursor);
+    if (backup?.vault && isStandardVault(backup.vault.vault)) {
+      if (!passphrase || passphrase.length < 12)
+        throw new Error('Standard backups require an export passphrase of at least 12 characters');
+      const raw = await this.standardRawKey(backup.vault.revision);
+      try {
+        const wrapped = await wrapVaultKey(
+          accountId,
+          raw,
+          passphrase,
+          backup.vault.vault.keyVersion,
+        );
+        this.guard(epoch, accountId);
+        backup.vault = { revision: backup.vault.revision, vault: wrapped.vault };
+      } finally {
+        raw.fill(0);
+      }
+    }
     return backup;
   }
   async decryptedExport() {
@@ -1064,8 +1381,12 @@ export class FinanceClient {
     if (!validTime(input.exportedAt)) throw new Error('Invalid export timestamp');
     if (!Number.isSafeInteger(input.vault.revision) || input.vault.revision < 1)
       throw new Error('Invalid vault revision');
-    const vault = vaultSchema.parse(input.vault.vault),
-      identities = new Set<string>();
+    const vault = vaultMetadataSchema.parse(input.vault.vault);
+    if (isStandardVault(vault))
+      throw new Error(
+        'This server-metadata export has no portable key. Export a passphrase-wrapped backup from the dashboard instead.',
+      );
+    const identities = new Set<string>();
     for (const doc of input.documents) {
       idSchema.parse(doc.id);
       namespaceSchema.parse(doc.namespace);
@@ -1118,6 +1439,56 @@ export class FinanceClient {
       if (!(error instanceof ApiFailure) || error.status !== 404) throw error;
     }
     check();
+    if (current && isStandardVault(current.vault)) {
+      if (!this.key) throw new Error('Unlock Standard mode before restoring a backup');
+      const existing = [...(await this.all('settings')), ...(await this.all('history'))];
+      check();
+      if (existing.length && resume?.digest !== digest)
+        throw new Error('Restore requires an empty account or the identical interrupted backup');
+      const retained = input.documents.filter(
+        (doc) => doc.namespace !== 'history' || new Date(doc.occurredAt!) >= calendarCutoff(),
+      );
+      const values = new Map<string, unknown>();
+      for (const doc of retained)
+        values.set(
+          `${doc.namespace}:${doc.id}`,
+          await decryptJson(importedKey, doc.envelope, {
+            accountId: account,
+            namespace: doc.namespace,
+            documentId: doc.id,
+            schemaVersion: 1,
+            keyVersion: vault.keyVersion,
+          }),
+        );
+      for (const doc of existing) {
+        const identity = `${doc.namespace}:${doc.id}`,
+          backup = retained.find((item) => `${item.namespace}:${item.id}` === identity);
+        if (
+          !backup ||
+          backup.product !== doc.product ||
+          canonical(await this.decrypt(doc)) !== canonical(values.get(identity))
+        )
+          throw new Error('Existing documents differ from the resumable backup');
+      }
+      check();
+      await this.stored(() => this.storage.set(resumeKey, { digest }), check);
+      for (const doc of retained) {
+        check();
+        if (existing.some((item) => item.namespace === doc.namespace && item.id === doc.id))
+          continue;
+        await this.put(
+          doc.namespace,
+          doc.id,
+          values.get(`${doc.namespace}:${doc.id}`),
+          0,
+          doc.occurredAt,
+          undefined,
+          doc.product,
+        );
+      }
+      await this.stored(() => this.storage.delete(resumeKey), check);
+      return;
+    }
     if (current && (resume?.digest !== digest || canonical(current.vault) !== canonical(vault)))
       throw new Error('Restore requires an empty vault, or resumption of this exact backup');
     const existing = [...(await this.all('settings')), ...(await this.all('history'))];

@@ -4,8 +4,8 @@ export const API_PREFIX = '/api/v1';
 export const MAX_REQUEST_BODY_BYTES = 1572864;
 export const MAX_DOCUMENT_BYTES = 1048576;
 export const ACCESS_TTL_SECONDS = 900;
-export const REFRESH_IDLE_DAYS = 90;
-export const REFRESH_ABSOLUTE_DAYS = 365;
+export const REFRESH_IDLE_DAYS = 30;
+export const REFRESH_ABSOLUTE_DAYS = 90;
 export const HISTORY_MONTHS = 3;
 export const DEFAULT_ENTITLEMENTS = {
   tier: 'free',
@@ -52,6 +52,47 @@ export const vaultSchema = z
   .strict();
 export type EncryptedEnvelope = z.infer<typeof encryptedEnvelopeSchema>;
 export type Vault = z.infer<typeof vaultSchema>;
+export const privateVaultSchema = vaultSchema
+  .extend({ version: z.literal(2), mode: z.literal('private') })
+  .strict();
+export const standardVaultSchema = z
+  .object({
+    version: z.literal(2),
+    mode: z.literal('standard'),
+    keyVersion: z.number().int().positive().max(2147483647),
+  })
+  .strict();
+export const vaultMetadataSchema = z.union([
+  vaultSchema,
+  z.discriminatedUnion('mode', [privateVaultSchema, standardVaultSchema]),
+]);
+export type PrivateVault = Vault | z.infer<typeof privateVaultSchema>;
+export type VaultMetadata = z.infer<typeof vaultMetadataSchema>;
+export const isStandardVault = (
+  vault: VaultMetadata,
+): vault is z.infer<typeof standardVaultSchema> => vault.version === 2 && vault.mode === 'standard';
+export const keyFileSchema = z
+  .object({
+    format: z.literal('finance-tools-key'),
+    version: z.literal(2),
+    accountId: idSchema,
+    keyVersion: z.number().int().positive().max(2147483647),
+    recoverySecret: encoded(32),
+  })
+  .strict();
+export const legacyRecoveryFileSchema = z
+  .object({ version: z.literal(1), accountId: idSchema, recoverySecret: encoded(32) })
+  .strict();
+export const vaultModeRequestSchema = z
+  .object({
+    clerkToken: z.string().min(1).max(16384),
+    mutationId: z.string().uuid(),
+    expectedRevision: z.number().int().positive(),
+    vault: z.union([privateVaultSchema, standardVaultSchema]),
+    rawKey: encoded(32).optional(),
+    trustServer: z.literal(true).optional(),
+  })
+  .strict();
 export interface DocumentContext {
   accountId: string;
   namespace: string;
@@ -85,7 +126,7 @@ export const vaultPutRequestSchema = z
   .object({
     expectedRevision: z.number().int().nonnegative(),
     mutationId: z.string().uuid(),
-    vault: vaultSchema,
+    vault: z.union([vaultSchema, privateVaultSchema]),
   })
   .strict();
 export const documentPutRequestSchema = z
@@ -114,6 +155,7 @@ export interface SessionInfo {
   client: z.infer<typeof clientSchema>;
   createdAt: string;
   lastUsedAt: string;
+  idleExpiresAt: string;
   absoluteExpiresAt: string;
   current: boolean;
 }
@@ -128,13 +170,14 @@ export interface StoredDocument {
 }
 export interface VaultResponse {
   revision: number;
-  vault: Vault;
+  vault: VaultMetadata;
 }
 export interface ApiError {
   error: { code: string; message: string; requestId: string; currentRevision?: number };
 }
 export interface MeResponse {
   accountId: string;
+  clerkSubject: string;
   entitlements: typeof DEFAULT_ENTITLEMENTS;
   namespaces: Namespace[];
   products: Product[];
@@ -165,7 +208,7 @@ export const exportPageSchema = z
     accountId: idSchema,
     exportedAt: z.string().datetime(),
     vault: z
-      .object({ revision: z.number().int().nonnegative(), vault: vaultSchema })
+      .object({ revision: z.number().int().nonnegative(), vault: vaultMetadataSchema })
       .strict()
       .nullable(),
     documents: z

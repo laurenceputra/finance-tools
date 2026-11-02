@@ -10,6 +10,8 @@ import {
   pairingRedeemRequestSchema,
   idSchema,
   DEFAULT_ENTITLEMENTS,
+  REFRESH_IDLE_DAYS,
+  REFRESH_ABSOLUTE_DAYS,
 } from '@finance-tools/contracts';
 import {
   accessToken,
@@ -28,14 +30,15 @@ import {
   unseal,
 } from './security';
 import type { Bindings, Client, Ctx, Session } from './security';
+import { initializeStandard } from './vaults';
 
 export const sessions = new Hono<Bindings>();
 const DAY = 86400000;
 const COOKIE = '__Host-finance-refresh';
-export function cookie(c: Ctx, token?: string) {
+export function cookie(c: Ctx, token?: string, absoluteExpires = now() + REFRESH_IDLE_DAYS * DAY) {
   c.header(
     'Set-Cookie',
-    `${COOKIE}=${token ?? ''}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=${token ? 90 * 86400 : 0}`,
+    `${COOKIE}=${token ?? ''}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=${token ? Math.max(0, Math.min(REFRESH_IDLE_DAYS * 86400, Math.floor((absoluteExpires - now()) / 1000))) : 0}`,
   );
 }
 function refreshCookie(c: Ctx): string | undefined {
@@ -57,8 +60,8 @@ export function newSession(account: string, client: Client): { session: Session;
       client: JSON.stringify(client),
       created_at: time,
       last_used_at: time,
-      idle_expires: time + 90 * DAY,
-      absolute_expires: time + 365 * DAY,
+      idle_expires: time + REFRESH_IDLE_DAYS * DAY,
+      absolute_expires: time + REFRESH_ABSOLUTE_DAYS * DAY,
       revoked_at: null,
       refresh_hash: '',
     },
@@ -97,7 +100,7 @@ export function insertSession(
 }
 export async function tokens(c: Ctx, session: Session, token: string) {
   const script = (JSON.parse(session.client) as Client).kind === 'userscript';
-  if (!script) cookie(c, token);
+  if (!script) cookie(c, token, session.absolute_expires);
   return c.json({
     accessToken: await accessToken(c.env, session),
     expiresIn: 900 as const,
@@ -150,6 +153,7 @@ sessions.post('/session/exchange', async (c) => {
     }>();
   if (!account || account.deleted_at !== null) fail(403, 'account_deleted');
   if (account.disabled_at !== null) fail(403, 'account_disabled');
+  await initializeStandard(c.env, account.id, account.session_epoch);
   const { session, token } = newSession(account.id, input.client);
   session.account_epoch = account.session_epoch;
   const result = await insertSession(c.env, session, await hash(token)).run();
@@ -191,7 +195,15 @@ sessions.post('/session/refresh', async (c) => {
     c.env.DB.prepare(
       `UPDATE sessions SET refresh_hash=?,last_used_at=?,idle_expires=MIN(?,absolute_expires)
       WHERE id=? AND refresh_hash=? AND EXISTS(SELECT 1 FROM refresh_history WHERE hash=? AND successor=?)`,
-    ).bind(successorHash, time, time + 90 * DAY, session.id, oldHash, oldHash, encrypted),
+    ).bind(
+      successorHash,
+      time,
+      time + REFRESH_IDLE_DAYS * DAY,
+      session.id,
+      oldHash,
+      oldHash,
+      encrypted,
+    ),
   ]);
   const previous = await c.env.DB.prepare(
     'SELECT request_id,successor,grace_until FROM refresh_history WHERE hash=?',
@@ -235,18 +247,25 @@ sessions.post('/session/logout-all', async (c) => {
   browser(c);
   await body(c, z.object({}).strict());
   await c.env.DB.prepare(
-    'UPDATE sessions SET revoked_at=? WHERE account_id=? AND account_epoch=? AND revoked_at IS NULL AND idle_expires>? AND absolute_expires>?',
+    `UPDATE accounts SET session_epoch=session_epoch+1,revocation_pending=1 WHERE id=? AND session_epoch=? AND deleted_at IS NULL AND disabled_at IS NULL AND EXISTS(SELECT 1 FROM sessions WHERE id=? AND account_id=accounts.id AND account_epoch=accounts.session_epoch AND revoked_at IS NULL AND idle_expires>? AND absolute_expires>?)`,
   )
-    .bind(now(), s.account_id, s.account_epoch ?? 0, now(), now())
+    .bind(s.account_id, s.account_epoch ?? 0, s.id, now(), now())
     .run();
   cookie(c);
   return c.body(null, 204);
 });
 sessions.get('/me', async (c) => {
   const s = await authenticate(c);
+  const account = await c.env.DB.prepare(
+    'SELECT subject FROM accounts WHERE id=? AND deleted_at IS NULL AND disabled_at IS NULL AND session_epoch=?',
+  )
+    .bind(s.account_id, s.account_epoch ?? 0)
+    .first<{ subject: string }>();
+  if (!account) fail(401, 'unauthorized');
   const client = JSON.parse(s.client) as Client;
   return c.json({
     accountId: s.account_id,
+    clerkSubject: account.subject,
     entitlements: DEFAULT_ENTITLEMENTS,
     namespaces: client.namespaces,
     products: client.products,
@@ -266,6 +285,7 @@ sessions.get('/sessions', async (c) => {
       client: JSON.parse(row.client),
       createdAt: iso(row.created_at),
       lastUsedAt: iso(row.last_used_at),
+      idleExpiresAt: iso(row.idle_expires),
       absoluteExpiresAt: iso(row.absolute_expires),
       current: row.id === s.id,
     })),

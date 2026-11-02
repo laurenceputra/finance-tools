@@ -217,6 +217,46 @@ beforeEach(async () => {
 });
 
 describe('real D1 API security', () => {
+  it('caps rotated idle/cookie deadlines to absolute expiry and fences delayed issuance after revoke-all', async () => {
+    const short = newSession('account_a', client);
+    short.session.absolute_expires = Date.now() + 60000;
+    short.session.idle_expires = short.session.absolute_expires;
+    await insertSession(env, short.session, await hash(short.token)).run();
+    const rotated = await request('/session/refresh', 'POST', {}, '', {
+      Cookie: `__Host-finance-refresh=${short.token}`,
+      'X-Finance-Refresh-Id': crypto.randomUUID(),
+    });
+    expect(rotated.status).toBe(200);
+    const age = Number(/Max-Age=(\d+)/.exec(rotated.headers.get('Set-Cookie')!)![1]);
+    expect(age).toBeGreaterThan(0);
+    expect(age).toBeLessThanOrEqual(60);
+    const row = await env.DB.prepare(
+      'SELECT idle_expires,absolute_expires FROM sessions WHERE id=?',
+    )
+      .bind(short.session.id)
+      .first<{ idle_expires: number; absolute_expires: number }>();
+    expect(row!.idle_expires).toBe(row!.absolute_expires);
+    const delayed = newSession('account_a', client);
+    expect((await request('/session/logout-all', 'POST', {})).status).toBe(204);
+    expect(
+      (await insertSession(env, delayed.session, await hash(delayed.token)).run()).meta.changes,
+    ).toBe(0);
+    expect((await request('/me')).status).toBe(401);
+  });
+  it('fails closed with a clear configuration error for new Standard accounts without a dedicated wrap secret', async () => {
+    const response = await request('/session/exchange', 'POST', {
+      clerkToken: await clerk('new_standard'),
+      client,
+    });
+    expect(response.status).toBe(500);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe(
+      'vault_wrap_not_configured',
+    );
+    const account = await env.DB.prepare('SELECT vault FROM accounts WHERE subject=?')
+      .bind('new_standard')
+      .first<{ vault: string | null }>();
+    expect(account?.vault).toBeNull();
+  });
   it('verifies Clerk signatures/freshness and only exchanges browser sessions', async () => {
     const valid = await clerk();
     expect(

@@ -6,7 +6,38 @@ import {
   DEFAULT_ENTITLEMENTS,
   MAX_REQUEST_BODY_BYTES,
   MAX_DOCUMENT_BYTES,
+  vaultMetadataSchema,
+  keyFileSchema,
+  legacyRecoveryFileSchema,
+  REFRESH_IDLE_DAYS,
+  REFRESH_ABSOLUTE_DAYS,
 } from './index';
+
+it('strictly discriminates public vault metadata and bound key files, never exposing server wraps', () => {
+  const standard = { version: 2, mode: 'standard', keyVersion: 1 };
+  expect(vaultMetadataSchema.parse(standard)).toEqual(standard);
+  for (const secret of ['rawKey', 'serverWrap', 'server_vault_wrap'])
+    expect(vaultMetadataSchema.safeParse({ ...standard, [secret]: 'secret' }).success).toBe(false);
+  expect(vaultMetadataSchema.safeParse({ ...standard, mode: 'private' }).success).toBe(false);
+  const file = {
+    format: 'finance-tools-key',
+    version: 2,
+    accountId: 'account',
+    keyVersion: 1,
+    recoverySecret: 'A'.repeat(43),
+  };
+  expect(keyFileSchema.parse(file)).toEqual(file);
+  expect(keyFileSchema.safeParse({ ...file, keyVersion: 0 }).success).toBe(false);
+  expect(keyFileSchema.safeParse({ ...file, unexpected: 'field' }).success).toBe(false);
+  expect(
+    legacyRecoveryFileSchema.parse({
+      version: 1,
+      accountId: 'account',
+      recoverySecret: 'A'.repeat(43),
+    }).version,
+  ).toBe(1);
+  expect([REFRESH_IDLE_DAYS, REFRESH_ABSOLUTE_DAYS]).toEqual([30, 90]);
+});
 
 it('requires explicit product scopes independently of display labels', () => {
   const client = { kind: 'userscript', name: 'Portfolio', namespaces: ['settings', 'history'] };

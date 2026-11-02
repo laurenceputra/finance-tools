@@ -1,5 +1,15 @@
-import { encryptedEnvelopeSchema, vaultSchema, kdfSchema } from '@finance-tools/contracts';
-import type { DocumentContext, EncryptedEnvelope, Vault } from '@finance-tools/contracts';
+import {
+  encryptedEnvelopeSchema,
+  vaultSchema,
+  privateVaultSchema,
+  kdfSchema,
+} from '@finance-tools/contracts';
+import type {
+  DocumentContext,
+  EncryptedEnvelope,
+  Vault,
+  PrivateVault,
+} from '@finance-tools/contracts';
 
 const utf8 = new TextEncoder();
 export function encodeBase64url(bytes: Uint8Array): string {
@@ -39,10 +49,11 @@ function aad(context: DocumentContext): Uint8Array<ArrayBuffer> {
     ]),
   );
 }
-async function importKey(raw: Uint8Array<ArrayBuffer>): Promise<CryptoKey> {
+export async function importVaultKey(raw: Uint8Array<ArrayBuffer>): Promise<CryptoKey> {
   if (raw.byteLength !== 32) throw new Error('Invalid key');
   return crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt', 'decrypt']);
 }
+const importKey = importVaultKey;
 export async function derivePassphraseKey(
   passphrase: string,
   input: Vault['kdf'],
@@ -110,8 +121,19 @@ export async function createVault(
   accountId: string,
   passphrase: string,
 ): Promise<{ vault: Vault; vaultKey: CryptoKey; recoverySecret: string }> {
-  const raw = random(32),
-    recovery = random(32);
+  return wrapVaultKey(accountId, random(32), passphrase);
+}
+// Conversion is deliberately bounded to wrapper decryption. Normal vault keys remain nonextractable.
+export async function wrapVaultKey(
+  accountId: string,
+  raw: Uint8Array<ArrayBuffer>,
+  passphrase: string,
+  keyVersion = 1,
+  recoverySecret?: string,
+): Promise<{ vault: Vault; vaultKey: CryptoKey; recoverySecret: string }> {
+  if (raw.length !== 32) throw new Error('Invalid key');
+  const recovery = recoverySecret ? decodeBase64url(recoverySecret) : random(32);
+  if (recovery.length !== 32) throw new Error('Invalid recovery key');
   const kdf: Vault['kdf'] = {
     name: 'PBKDF2',
     hash: 'SHA-256',
@@ -120,23 +142,23 @@ export async function createVault(
   };
   const vault: Vault = {
     version: 1,
-    keyVersion: 1,
+    keyVersion,
     kdf,
     passphraseEnvelope: await encryptBytes(
       await derivePassphraseKey(passphrase, kdf),
       raw,
-      vaultContext(accountId, 1, 'passphrase'),
+      vaultContext(accountId, keyVersion, 'passphrase'),
     ),
     recoveryEnvelope: await encryptBytes(
       await importKey(recovery),
       raw,
-      vaultContext(accountId, 1, 'recovery'),
+      vaultContext(accountId, keyVersion, 'recovery'),
     ),
   };
   return { vault, vaultKey: await importKey(raw), recoverySecret: encodeBase64url(recovery) };
 }
-function validateVault(input: Vault): Vault {
-  const vault = vaultSchema.parse(input);
+function validateVault(input: PrivateVault): PrivateVault {
+  const vault = input.version === 1 ? vaultSchema.parse(input) : privateVaultSchema.parse(input);
   if (
     vault.passphraseEnvelope.keyVersion !== vault.keyVersion ||
     vault.recoveryEnvelope.keyVersion !== vault.keyVersion
@@ -154,7 +176,7 @@ function validateVault(input: Vault): Vault {
 }
 export async function unlockVault(
   accountId: string,
-  input: Vault,
+  input: PrivateVault,
   passphrase: string,
 ): Promise<CryptoKey> {
   const vault = validateVault(input);
@@ -168,7 +190,7 @@ export async function unlockVault(
 }
 export async function recoverVault(
   accountId: string,
-  input: Vault,
+  input: PrivateVault,
   recoverySecret: string,
 ): Promise<CryptoKey> {
   const vault = validateVault(input);
@@ -183,10 +205,10 @@ export async function recoverVault(
 // Rewrap the same raw vault key; document ciphertext and keyVersion remain unchanged.
 export async function rewrapVaultPassphrase(
   accountId: string,
-  input: Vault,
+  input: PrivateVault,
   credential: { passphrase: string } | { recoverySecret: string },
   newPassphrase: string,
-): Promise<Vault> {
+): Promise<PrivateVault> {
   const vault = validateVault(input);
   const recovery = 'recoverySecret' in credential;
   const wrappingKey = recovery
@@ -207,6 +229,21 @@ export async function rewrapVaultPassphrase(
       vaultContext(accountId, vault.keyVersion, 'passphrase'),
     ),
   };
+}
+export async function unwrapVaultKey(
+  accountId: string,
+  input: PrivateVault,
+  credential: string,
+  recovery = false,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const vault = validateVault(input);
+  return decryptBytes(
+    recovery
+      ? await importKey(decodeBase64url(credential))
+      : await derivePassphraseKey(credential, vault.kdf),
+    recovery ? vault.recoveryEnvelope : vault.passphraseEnvelope,
+    vaultContext(accountId, vault.keyVersion, recovery ? 'recovery' : 'passphrase'),
+  );
 }
 export async function encryptJson(
   key: CryptoKey,

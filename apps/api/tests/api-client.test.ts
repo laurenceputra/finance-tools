@@ -12,6 +12,8 @@ import type {
   StoredDocument,
 } from '@finance-tools/contracts';
 import { key, random } from '../src/security';
+import { decryptJson, unlockVault } from '@finance-tools/crypto';
+import { isStandardVault, type Vault } from '@finance-tools/contracts';
 
 const ORIGIN = 'https://finance.example.com';
 let mf: Miniflare, env: Env, privateKey: CryptoKey;
@@ -32,11 +34,14 @@ function storage(): Storage {
     async delete(key) {
       values.delete(key);
     },
+    async keys() {
+      return [...values.keys()];
+    },
   };
 }
-async function clerk(subject = 'user_client') {
+async function clerk(subject = 'user_client', fva = [0, -1]) {
   const time = Math.floor(Date.now() / 1000);
-  return new SignJWT({ azp: ORIGIN, sid: 'sess_clerk', v: 2, fva: [0, -1], nbf: time - 5 })
+  return new SignJWT({ azp: ORIGIN, sid: 'sess_clerk', v: 2, fva, nbf: time - 5 })
     .setProtectedHeader({ alg: 'RS256', typ: 'JWT', kid: 'test' })
     .setSubject(subject)
     .setIssuer(env.CLERK_ISSUER)
@@ -109,6 +114,7 @@ beforeAll(async () => {
     CLERK_PUBLISHABLE_KEY: 'pk_test_example',
     ACCESS_JWT_SECRET: random(),
     SESSION_WRAP_SECRET: random(),
+    VAULT_WRAP_SECRET: random(),
     CLERK_WEBHOOK_SECRET: 'whsec_' + btoa('x'.repeat(32)),
   };
   const bundle = await build({
@@ -199,10 +205,17 @@ async function pair(
   return { script, gm };
 }
 
+async function makePrivate(browser: FinanceClient, passphrase: string, subject = 'user_client') {
+  const prepared = await browser.preparePrivate(passphrase);
+  await browser.finishPrivate(prepared, await clerk(subject));
+  await browser.unlockKeyFile(prepared.keyFile);
+  return { recoverySecret: prepared.keyFile.recoverySecret };
+}
+
 it('assembles a full version-1 browser backup across count-bounded export requests', async () => {
   const browser = new FinanceClient(browserTransport(), storage(), 'browser');
   await browser.exchange(await clerk());
-  await browser.finishVault(await browser.prepareVault('test passphrase'));
+  expect(browser.unlocked).toBe(true);
   await browser.put('settings', 'base', { private: 'encrypted only' }, 0);
   const row = await env.DB.prepare("SELECT blob_key FROM documents WHERE id='base'").first<{
     blob_key: string;
@@ -218,7 +231,7 @@ it('assembles a full version-1 browser backup across count-bounded export reques
     ),
   );
   for (let i = 0; i < statements.length; i += 40) await env.DB.batch(statements.slice(i, i + 40));
-  const backup = await browser.encryptedExport();
+  const backup = await browser.encryptedExport('backup-only-passphrase');
   expect(backup.documents).toHaveLength(103);
   expect(new Set(backup.documents.map((doc) => doc.id)).size).toBe(103);
   expect(backup).not.toHaveProperty('cursor');
@@ -242,13 +255,251 @@ it('assembles a full version-1 browser backup across count-bounded export reques
   await expect(browser.encryptedExport()).rejects.toMatchObject({ status: 500 });
 });
 
+it('defaults to recoverable Standard, pairs scripts without a password, and preserves the same key through fresh verified mode changes and retries', async () => {
+  const local = storage(),
+    browser = new FinanceClient(browserTransport(), local, 'browser');
+  await browser.exchange(await clerk());
+  expect(browser.vault?.vault).toEqual({ version: 2, mode: 'standard', keyVersion: 1 });
+  expect(browser.me?.clerkSubject).toBe('user_client');
+  expect(browser.unlocked).toBe(true);
+  expect(await local.get('remembered')).toBeUndefined();
+  const doc = await browser.put('settings', 'continuity', { private: 'same-key' }, 0);
+  const { script, gm } = await pair(browser, 'portfolio', 'Standard script');
+  expect(script.unlocked).toBe(true);
+  expect(await script.decrypt(doc)).toEqual({ private: 'same-key' });
+  await script.refresh();
+  const restarted = new FinanceClient(gmTransport, gm, 'userscript', undefined, ['portfolio']);
+  await restarted.initialize();
+  expect(await restarted.decrypt(doc)).toEqual({ private: 'same-key' });
+  const publicBackup = await browser.request<ExportPage>('/export');
+  expect(JSON.stringify(publicBackup)).not.toMatch(/server_vault_wrap|rawKey/);
+  await expect(browser.encryptedExport()).rejects.toThrow('export passphrase');
+  const backup = await browser.encryptedExport('portable-backup-password');
+  const backupVault = backup.vault!.vault as Vault;
+  expect(backupVault.version).toBe(1);
+  const backupKey = await unlockVault(
+    browser.me!.accountId,
+    backupVault,
+    'portable-backup-password',
+  );
+  expect(
+    await decryptJson(backupKey, doc.envelope, {
+      accountId: browser.me!.accountId,
+      namespace: 'settings',
+      documentId: doc.id,
+      schemaVersion: 1,
+      keyVersion: 1,
+    }),
+  ).toEqual({ private: 'same-key' });
+  const before = await browser.request<{ revision: number; rawKey: string }>('/vault/key', 'POST', {
+    expectedRevision: 1,
+  });
+  await expect(
+    browser.request('/vault/key', 'POST', { expectedRevision: 9 }),
+  ).rejects.toMatchObject({ status: 409 });
+  const prepared = await browser.preparePrivate('private-mode-password');
+  const proof = {
+    expectedRevision: prepared.revision,
+    mutationId: prepared.mutationId,
+    vault: prepared.vault,
+    clerkToken: await clerk(),
+  };
+  await expect(
+    browser.request('/vault/mode', 'PUT', { ...proof, clerkToken: await clerk('user_other') }),
+  ).rejects.toMatchObject({ status: 403 });
+  // Commit succeeded, response was lost: the same intent replays without a second revision.
+  loseBrowser = '/vault/mode';
+  await expect(browser.finishPrivate(prepared, await clerk())).rejects.toThrow('Response lost');
+  await browser.finishPrivate(prepared, await clerk());
+  expect(browser.vault?.revision).toBe(2);
+  expect(browser.unlocked).toBe(false);
+  const stored = await env.DB.prepare('SELECT vault,server_vault_wrap FROM accounts WHERE id=?')
+    .bind(browser.me!.accountId)
+    .first<{ vault: string; server_vault_wrap: string | null }>();
+  expect(stored!.server_vault_wrap).toBeNull();
+  const receipts = await env.DB.prepare(
+    "SELECT response FROM mutations WHERE namespace='vault-mode'",
+  ).all<{ response: string }>();
+  expect(JSON.stringify(receipts.results)).not.toMatch(
+    /passphraseEnvelope|recoveryEnvelope|rawKey|server_vault_wrap/,
+  );
+  await expect(
+    restarted.request('/vault/key', 'POST', { expectedRevision: 2 }),
+  ).rejects.toMatchObject({ status: 409, code: 'private_key_required' });
+  const newDevice = new FinanceClient(browserTransport(), storage(), 'browser');
+  await newDevice.initialize();
+  expect(newDevice.unlocked).toBe(false);
+  await expect(
+    newDevice.unlockKeyFile({ ...prepared.keyFile, accountId: 'other' }),
+  ).rejects.toThrow('different account');
+  await expect(newDevice.unlockKeyFile({ ...prepared.keyFile, keyVersion: 2 })).rejects.toThrow(
+    'key version',
+  );
+  await newDevice.unlockKeyFile(prepared.keyFile);
+  expect(await newDevice.decrypt(doc)).toEqual({ private: 'same-key' });
+  await browser.unlockKeyFile(prepared.keyFile);
+  loseBrowser = '/vault/mode';
+  await expect(
+    browser.enableStandard(prepared.keyFile.recoverySecret, true, await clerk(), true),
+  ).rejects.toThrow('Response lost');
+  await browser.enableStandard(prepared.keyFile.recoverySecret, true, await clerk(), true);
+  expect(browser.vault?.revision).toBe(3);
+  expect(browser.unlocked).toBe(false);
+  await browser.unlockStandard();
+  const after = await browser.request<{ rawKey: string }>('/vault/key', 'POST', {
+    expectedRevision: 3,
+  });
+  expect(after.rawKey).toBe(before.rawKey);
+  expect(await browser.decrypt(doc)).toEqual({ private: 'same-key' });
+  for (const name of await local.keys!())
+    expect(JSON.stringify(await local.get(name))).not.toContain(before.rawKey);
+  await expect(newDevice.loadVault()).rejects.toThrow('mode or key version changed');
+  expect(newDevice.unlocked).toBe(false);
+  await browser.request('/account', 'DELETE', {
+    clerkToken: await clerk(),
+    confirmation: 'DELETE',
+  });
+  expect(
+    (await env.DB.prepare('SELECT server_vault_wrap FROM accounts WHERE id=?')
+      .bind(browser.me!.accountId)
+      .first<{ server_vault_wrap: string | null }>())!.server_vault_wrap,
+  ).toBeNull();
+  await expect(script.request('/vault/key', 'POST', { expectedRevision: 3 })).rejects.toMatchObject(
+    { status: 401 },
+  );
+}, 30000);
+
+it.each(['standard', 'private'])(
+  'restores a portable %s encrypted backup into an initialized empty Standard vault without replacing its key',
+  async (mode) => {
+    const browser = new FinanceClient(browserTransport(), storage(), 'browser');
+    await browser.exchange(await clerk());
+    if (mode === 'private') await makePrivate(browser, 'portable-backup-password');
+    await browser.put('settings', 'restore', { sensitive: 'portable' }, 0);
+    const backup = await browser.encryptedExport('portable-backup-password');
+    if (mode === 'private') {
+      expect(backup.vault?.vault.version).toBe(2);
+      await browser.enableStandard('portable-backup-password', false, await clerk(), true);
+      await browser.unlockStandard();
+    }
+    // Model lost documents with an existing initialized account, not a new account or data-key reset.
+    await env.DB.prepare('DELETE FROM documents WHERE account_id=?')
+      .bind(browser.me!.accountId)
+      .run();
+    await env.DB.prepare('DELETE FROM mutations WHERE account_id=?')
+      .bind(browser.me!.accountId)
+      .run();
+    await browser.restore(backup, 'portable-backup-password');
+    expect(isStandardVault(browser.vault!.vault)).toBe(true);
+    expect(await browser.decrypt((await browser.all('settings'))[0])).toEqual({
+      sensitive: 'portable',
+    });
+  },
+  30000,
+);
+
+it('concurrent verified exchanges initialize one Standard key and release only the committed winner', async () => {
+  const a = new FinanceClient(browserTransport(), storage(), 'browser');
+  const b = new FinanceClient(browserTransport(), storage(), 'browser');
+  const token = await clerk();
+  await Promise.all([a.exchange(token), b.exchange(token)]);
+  const doc = await a.put('settings', 'winner', { only: 'committed-key' }, 0);
+  expect(await b.decrypt(doc)).toEqual({ only: 'committed-key' });
+  expect(a.vault?.revision).toBe(1);
+  expect(b.vault?.revision).toBe(1);
+  const sessions = (await a.request<{ sessions: SessionInfo[] }>('/sessions')).sessions;
+  expect(sessions).toHaveLength(2);
+  const duration = Date.parse(sessions[0].absoluteExpiresAt) - Date.parse(sessions[0].createdAt);
+  expect(duration).toBe(90 * 86400000);
+  expect(Date.parse(sessions[0].idleExpiresAt) - Date.parse(sessions[0].createdAt)).toBe(
+    30 * 86400000,
+  );
+  const oldEpoch = await env.DB.prepare('SELECT session_epoch FROM accounts WHERE id=?')
+    .bind(a.me!.accountId)
+    .first<{ session_epoch: number }>();
+  const id = a.me!.accountId;
+  await a.disconnect(true);
+  expect(
+    (await env.DB.prepare('SELECT session_epoch FROM accounts WHERE id=?')
+      .bind(id)
+      .first<{ session_epoch: number }>())!.session_epoch,
+  ).toBe(oldEpoch!.session_epoch + 1);
+  await expect(b.request('/vault/key', 'POST', { expectedRevision: 1 })).rejects.toMatchObject({
+    status: 401,
+  });
+});
+
+it('binds server wraps to the account and fails closed on copied/corrupt wraps', async () => {
+  const a = new FinanceClient(browserTransport(), storage(), 'browser');
+  await a.exchange(await clerk());
+  const saved = await env.DB.prepare('SELECT server_vault_wrap FROM accounts WHERE id=?')
+    .bind(a.me!.accountId)
+    .first<{ server_vault_wrap: string }>();
+  const b = new FinanceClient(browserTransport(), storage(), 'browser');
+  await b.exchange(await clerk('user_other'));
+  await env.DB.prepare('UPDATE accounts SET server_vault_wrap=? WHERE id=?')
+    .bind(saved!.server_vault_wrap, b.me!.accountId)
+    .run();
+  await expect(b.request('/vault/key', 'POST', { expectedRevision: 1 })).rejects.toMatchObject({
+    status: 500,
+    code: 'vault_wrap_unavailable',
+  });
+  expect(await a.request('/vault/key', 'POST', { expectedRevision: 1 })).toHaveProperty('rawKey');
+});
+
+it('serializes competing mode CAS, requires genuinely fresh factors, and rejects changed-intent replay without retaining key payloads', async () => {
+  const browser = new FinanceClient(browserTransport(), storage(), 'browser');
+  await browser.exchange(await clerk());
+  const a = await browser.preparePrivate('private-passphrase-a');
+  const b = await browser.preparePrivate('private-passphrase-b');
+  const input = {
+    expectedRevision: 1,
+    mutationId: a.mutationId,
+    vault: a.vault,
+    clerkToken: await clerk(),
+  };
+  await expect(
+    browser.request('/vault/mode', 'PUT', {
+      ...input,
+      clerkToken: await clerk('user_client', [6, -1]),
+    }),
+  ).rejects.toMatchObject({ status: 403, code: 'reverification_required' });
+  await expect(
+    browser.request('/vault/mode', 'PUT', { ...input, clerkToken: await clerk('user_client', []) }),
+  ).rejects.toMatchObject({ status: 403 });
+  const results = await Promise.allSettled([
+    browser.request('/vault/mode', 'PUT', input),
+    browser.request('/vault/mode', 'PUT', { ...input, mutationId: b.mutationId, vault: b.vault }),
+  ]);
+  expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+  const rejected = results.find((result) => result.status === 'rejected') as PromiseRejectedResult;
+  expect(rejected.reason).toMatchObject({ status: 409, code: 'revision_conflict' });
+  const won =
+    results[0].status === 'fulfilled'
+      ? input
+      : { ...input, mutationId: b.mutationId, vault: b.vault };
+  await expect(
+    browser.request('/vault/mode', 'PUT', { ...won, expectedRevision: 2 }),
+  ).rejects.toMatchObject({ status: 409, code: 'mutation_conflict' });
+  const account = await env.DB.prepare(
+    'SELECT vault_revision,server_vault_wrap FROM accounts WHERE id=?',
+  )
+    .bind(browser.me!.accountId)
+    .first();
+  expect(account).toEqual({ vault_revision: 2, server_vault_wrap: null });
+  expect(
+    (await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM mutations WHERE namespace='vault-mode'",
+    ).first<{ n: number }>())!.n,
+  ).toBe(1);
+}, 30000);
+
 it('integrates browser cookies and anonymous GM credentials through vault, pairing, product CRUD, refresh loss recovery, export and session revocation', async () => {
   const browser = new FinanceClient(browserTransport(), storage(), 'browser');
   await browser.exchange(await clerk());
   expect(browser.me?.products).toEqual(['portfolio', 'bank-subcaps']);
   expect(browserCookie).toContain('__Host-finance-refresh=');
-  const prepared = await browser.prepareVault('test passphrase');
-  await browser.finishVault(prepared);
+  const prepared = await makePrivate(browser, 'test passphrase');
   const portfolio = await pair(browser, 'portfolio', 'Portfolio script', true),
     bank = await pair(browser, 'bank-subcaps', 'Bank script');
   await portfolio.script.unlock(prepared.recoverySecret, true);
@@ -416,8 +667,7 @@ it('integrates vault rewrap, delete step-up/retry and irreversible account revoc
   const transport = browserTransport(),
     browser = new FinanceClient(transport, storage(), 'browser');
   await browser.exchange(await clerk());
-  const prepared = await browser.prepareVault('first passphrase');
-  await browser.finishVault(prepared);
+  await makePrivate(browser, 'first passphrase');
   await browser.put('settings', 'a', { secret: 'never plaintext on API' }, 0);
   await browser.rewrap('first passphrase', 'new passphrase');
   await browser.lock();
@@ -441,8 +691,7 @@ it('integrates vault rewrap, delete step-up/retry and irreversible account revoc
 it('cancels an old-account ciphertext mutation when browser-cookie refresh changes principal', async () => {
   const first = new FinanceClient(browserTransport(), storage(), 'browser');
   await first.exchange(await clerk());
-  const a = await first.prepareVault('first account secret');
-  await first.finishVault(a);
+  await makePrivate(first, 'first account secret');
   await first.put('settings', 'shared', { value: 'first account' }, 0);
   const originalId = first.me!.accountId;
   const firstSession = await env.DB.prepare('SELECT id FROM sessions WHERE account_id=?')
@@ -452,8 +701,7 @@ it('cancels an old-account ciphertext mutation when browser-cookie refresh chang
   // while this tab still holds the first account's memory key and me response.
   const second = new FinanceClient(browserTransport(), storage(), 'browser');
   await second.exchange(await clerk('user_other'));
-  const b = await second.prepareVault('second account secret');
-  await second.finishVault(b);
+  await makePrivate(second, 'second account secret', 'user_other');
   await second.put('settings', 'shared', { value: 'second account' }, 0);
   const time = Math.floor(Date.now() / 1000);
   const expired = await new SignJWT({ sid: firstSession!.id })

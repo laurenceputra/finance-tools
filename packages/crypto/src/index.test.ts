@@ -6,9 +6,39 @@ import {
   rewrapVaultPassphrase,
   encryptJson,
   decryptJson,
+  unwrapVaultKey,
+  wrapVaultKey,
+  importVaultKey,
 } from './index';
 
 describe('vault encryption', () => {
+  it('converts only bounded wrapper plaintext and retains nonextractable keys and account/version binding', async () => {
+    const original = await createVault('account', 'private-passphrase');
+    const raw = await unwrapVaultKey('account', original.vault, original.recoverySecret, true);
+    try {
+      const converted = await wrapVaultKey(
+        'account',
+        raw,
+        'next-passphrase',
+        7,
+        original.recoverySecret,
+      );
+      const metadata = { ...converted.vault, version: 2 as const, mode: 'private' as const };
+      const key = await recoverVault('account', metadata, original.recoverySecret);
+      expect(key.extractable).toBe(false);
+      expect((await importVaultKey(raw)).extractable).toBe(false);
+      await expect(crypto.subtle.exportKey('raw', key)).rejects.toThrow();
+      expect(await unwrapVaultKey('account', metadata, 'next-passphrase')).toEqual(raw);
+      await expect(
+        recoverVault('other-account', metadata, original.recoverySecret),
+      ).rejects.toThrow();
+      await expect(
+        recoverVault('account', { ...metadata, keyVersion: 8 }, original.recoverySecret),
+      ).rejects.toThrow();
+    } finally {
+      raw.fill(0);
+    }
+  });
   it('round trips JSON, isolates contexts, and rewraps without changing document keys', async () => {
     const { vault, vaultKey, recoverySecret } = await createVault(
       'account-1',

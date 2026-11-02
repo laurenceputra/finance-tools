@@ -1,11 +1,20 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { SignIn, useAuth, useClerk, useSession } from '@clerk/clerk-react';
-import { FinanceClient, download, mergeSettings, previewLegacyConfig } from '@finance-tools/client';
+import {
+  ApiFailure,
+  FinanceClient,
+  download,
+  mergeSettings,
+  previewLegacyConfig,
+} from '@finance-tools/client';
 import type { Storage } from '@finance-tools/client';
 import type { SessionInfo, StoredDocument, ExportResponse } from '@finance-tools/contracts';
 import './style.css';
 import { FinancialViews } from './FinancialViews';
 import { decodeBase64url } from '@finance-tools/crypto';
+import { isStandardVault } from '@finance-tools/contracts';
+import { StepUp } from './StepUp';
+import type { MeResponse } from '@finance-tools/contracts';
 
 type Decoded = { document: StoredDocument; value: unknown };
 type ClerkSession = NonNullable<ReturnType<typeof useSession>['session']>;
@@ -37,16 +46,12 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
     [showSignIn, setShowSignIn] = useState(false);
   const bootstrapStarted = useRef(false),
     identityFlight = useRef(false);
-  const mismatch = !!(
-    isLoaded &&
-    isSignedIn &&
-    userId &&
-    binding !== undefined &&
-    (!binding ||
-      binding.blocked ||
-      binding.clerkSubject !== userId ||
-      (client.me && binding.accountId && binding.accountId !== client.me.accountId))
-  );
+  const autoAttempt = useRef<string | undefined>(undefined),
+    suppressConnect = useRef(false);
+  const [needsConnection, setNeedsConnection] = useState(false);
+  const [principal, setPrincipal] = useState<Pick<MeResponse, 'accountId' | 'clerkSubject'>>();
+  const knownSubject = principal?.clerkSubject ?? client.me?.clerkSubject ?? binding?.clerkSubject;
+  const mismatch = !!(isLoaded && isSignedIn && userId && knownSubject && knownSubject !== userId);
   const [ready, setReady] = useState(false),
     [busy, setBusy] = useState(false),
     [error, setError] = useState(''),
@@ -64,6 +69,10 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
   const [prepared, setPrepared] = useState<Awaited<ReturnType<typeof client.prepareVault>>>(),
     [downloaded, setDownloaded] = useState(false),
     [ack, setAck] = useState(false);
+  const [privatePrepared, setPrivatePrepared] =
+    useState<Awaited<ReturnType<typeof client.preparePrivate>>>();
+  const [modeAction, setModeAction] = useState<'private' | 'standard'>();
+  const [trustServer, setTrustServer] = useState(false);
   const [pairId, setPairId] = useState(new URLSearchParams(location.search).get('pairingId') ?? ''),
     [code, setCode] = useState(new URLSearchParams(location.search).get('code') ?? ''),
     [pair, setPair] = useState<{
@@ -107,7 +116,9 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
     guardDeletion(intent);
     const token = await freshClerkToken();
     guardDeletion(intent);
-    await client.request('/account', 'DELETE', { clerkToken: token, confirmation: 'DELETE' });
+    await client.request('/account', 'DELETE', { clerkToken: token, confirmation: 'DELETE' }, () =>
+      guardDeletion(intent),
+    );
     guardDeletion(intent);
     await client.forgetSession();
     setReady(false);
@@ -143,6 +154,8 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
       setSettings([]);
       setSettingText('{}');
       setPrepared(undefined);
+      setPrivatePrepared(undefined);
+      setModeAction(undefined);
       setCredential('');
       setNewPassphrase('');
       setRestoreCredential('');
@@ -171,21 +184,36 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
     const legacy = await storage.get<string>('clerk-subject');
     return legacy ? { clerkSubject: legacy } : null;
   }
-  function actorMatches(value: IdentityBinding | null) {
-    return (
-      !signedActor.current ||
-      (!!value && !value.blocked && value.clerkSubject === signedActor.current)
-    );
+  function assertIdentity(me: MeResponse) {
+    if (!me.clerkSubject)
+      throw new Error('Finance identity metadata is unavailable. Retry session restoration.');
+    setPrincipal({ accountId: me.accountId, clerkSubject: me.clerkSubject });
+    if (signedActor.current && me.clerkSubject !== signedActor.current)
+      throw new Error('Finance session identity changed. Connect the intended signed-in account.');
   }
   async function restoreSession() {
     const value = await readBinding();
     setBinding(value);
-    if (value?.blocked || !actorMatches(value)) return;
-    await client.initialize();
-    if (!actorMatches(value) || (value?.accountId && value.accountId !== client.me?.accountId)) {
-      await client.forgetSession();
-      throw new Error('Finance session identity changed. Connect the intended signed-in account.');
+    if (value?.blocked) return;
+    try {
+      await client.initialize(assertIdentity);
+    } catch (error) {
+      if (error instanceof ApiFailure && error.status === 401) {
+        setNeedsConnection(true);
+        setShowSignIn(true);
+        return;
+      }
+      throw error;
     }
+    if (!client.me) return;
+    assertIdentity(client.me);
+    const verifiedBinding = {
+      clerkSubject: client.me.clerkSubject,
+      accountId: client.me.accountId,
+    };
+    await storage.set('identity-binding', verifiedBinding);
+    assertIdentity(client.me);
+    setBinding(verifiedBinding);
     setReady(!!client.me);
     setLocked(!client.unlocked);
     if (client.unlocked) await loadData();
@@ -196,12 +224,14 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
     // The Finance refresh cookie is independent of Clerk's lifetime/loading state.
     void run(restoreSession).finally(() => setBootstrapping(false));
   }, []);
-  useEffect(() => {
-    if (!mismatch || bootstrapping || identityFlight.current) return;
+  useLayoutEffect(() => {
+    if (!mismatch || (bootstrapping && !principal && !client.me) || identityFlight.current) return;
     identityFlight.current = true;
     setReady(false);
     // This is an actual different signed-in identity, not Clerk expiration/sign-out.
-    const old = binding;
+    const old = principal
+      ? { clerkSubject: principal.clerkSubject, accountId: principal.accountId }
+      : binding;
     const disconnected = client.disconnect().then(
       () => ({ error: undefined }),
       (error: unknown) => ({ error }),
@@ -217,8 +247,32 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
     }).finally(() => {
       identityFlight.current = false;
     });
-  }, [mismatch, bootstrapping]);
+  }, [mismatch, bootstrapping, principal]);
+  useEffect(() => {
+    if (
+      bootstrapping ||
+      ready ||
+      !needsConnection ||
+      !isLoaded ||
+      !isSignedIn ||
+      !userId ||
+      mismatch ||
+      binding?.blocked ||
+      suppressConnect.current ||
+      autoAttempt.current === userId
+    )
+      return;
+    autoAttempt.current = userId;
+    void run(connectBrowser);
+  }, [bootstrapping, ready, needsConnection, isLoaded, isSignedIn, userId, mismatch, binding]);
+  useEffect(() => {
+    if (tab !== 'Sessions' || !ready || mismatch) return;
+    void run(async () =>
+      setSessions((await client.request<{ sessions: SessionInfo[] }>('/sessions')).sessions),
+    );
+  }, [tab, ready, mismatch]);
   async function loadData(more = false) {
+    if (client.me) assertIdentity(client.me);
     const epoch = client.lockEpoch;
     const page =
       !more && tab === 'Overview'
@@ -228,6 +282,7 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
       page.documents.map(async (document) => ({ document, value: await client.decrypt(document) })),
     );
     if (client.lockEpoch !== epoch || !client.unlocked) return;
+    if (client.me) assertIdentity(client.me);
     setHistory((old) => (more ? [...old, ...decoded] : decoded));
     setCursor(page.cursor);
     if (!more) {
@@ -236,6 +291,7 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
         docs.map(async (document) => ({ document, value: await client.decrypt(document) })),
       );
       if (client.lockEpoch !== epoch || !client.unlocked) return;
+      if (client.me) assertIdentity(client.me);
       setSettings(current);
       setSettingText(
         JSON.stringify(current.find((x) => x.document.id === settingsId)?.value ?? {}, null, 2),
@@ -295,12 +351,17 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
     const subject = userId,
       token = await freshClerkToken();
     if (!subject) throw new Error('Sign in again');
-    await client.exchange(token);
+    await client.exchange(token, assertIdentity);
     if (currentUser.current !== subject || !client.me) {
       await client.forgetSession();
       throw new Error('Identity changed during connection');
     }
     const value = { clerkSubject: subject, accountId: client.me.accountId };
+    if (client.me.clerkSubject !== subject) {
+      await client.forgetSession();
+      throw new Error('Finance session subject does not match Clerk');
+    }
+    setPrincipal(value);
     await storage.set('identity-binding', value);
     if (currentUser.current !== subject) {
       await client.forgetSession();
@@ -309,8 +370,12 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
     setBinding(value);
     setShowSignIn(false);
     setReady(true);
+    setLocked(!client.unlocked);
+    setNeedsConnection(false);
+    if (client.unlocked) await loadData();
   }
   async function logout(all = false) {
+    suppressConnect.current = true;
     const blocked = { ...(binding ?? { clerkSubject: '' }), blocked: true };
     await storage.set('identity-binding', blocked);
     setBinding(blocked);
@@ -321,8 +386,12 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
       await clerk.signOut();
     }
   }
-  const button = (label: string, action: () => Promise<void>, danger = false) => (
-    <button disabled={busy} className={danger ? 'danger' : ''} onClick={() => void run(action)}>
+  const button = (label: string, action: () => Promise<void>, danger = false, enabled = true) => (
+    <button
+      disabled={busy || !enabled}
+      className={danger ? 'danger' : ''}
+      onClick={() => void run(action)}
+    >
       {label}
     </button>
   );
@@ -337,7 +406,7 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
     <div className="shell">
       <header>
         <div>
-          <span className="eyebrow">PRIVATE FINANCE</span>
+          <span className="eyebrow">FINANCE TOOLS</span>
           <h1>Your dashboard</h1>
         </div>
         <span className="badge">
@@ -350,21 +419,30 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
               : 'Not connected'}
         </span>
       </header>
-      <nav>
-        {[
-          'Overview',
-          'History',
-          'Settings',
-          'Vault',
-          'Pair a script',
-          'Sessions',
-          'Export & account',
-        ].map((name) => (
-          <button key={name} className={tab === name ? 'active' : ''} onClick={() => setTab(name)}>
-            {name}
-          </button>
-        ))}
-      </nav>
+      {ready && !mismatch && (
+        <nav>
+          {(locked
+            ? ['Vault', 'Sessions', 'Export & account']
+            : [
+                'Overview',
+                'History',
+                'Settings',
+                'Vault',
+                'Pair a script',
+                'Sessions',
+                'Export & account',
+              ]
+          ).map((name) => (
+            <button
+              key={name}
+              className={tab === name ? 'active' : ''}
+              onClick={() => setTab(name)}
+            >
+              {name}
+            </button>
+          ))}
+        </nav>
+      )}
       <main aria-busy={busy}>
         {error && (
           <p role="alert" className="error">
@@ -380,7 +458,7 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
           <p>
             {ready && !mismatch
               ? 'Your Finance session is active independently of Clerk sign-in.'
-              : 'Clerk is used only for an explicit new Finance connection or sensitive action.'}{' '}
+              : 'Sign in with Clerk to open Finance; new accounts use recoverable Standard encryption.'}{' '}
             {!isLoaded
               ? 'Clerk is loading; existing Finance access does not depend on it.'
               : !isSignedIn
@@ -407,15 +485,15 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
         </section>
         {!ready || mismatch ? (
           <section>
-            <h2>Connect your browser</h2>
+            <h2>{isSignedIn ? 'Connect your browser' : 'Sign in to Finance'}</h2>
             <p>
-              Retry the existing Finance cookie session after transient failures, even if Clerk
-              expired. If the Finance session reached its idle/absolute expiry or was revoked, sign
-              in with Clerk and explicitly connect a new session. A different signed-in Clerk
-              identity must connect separately; old decrypted views are cleared first.
+              Sign in to continue automatically. After a transient connection failure, retry your
+              existing Finance session, even if Clerk expired. Explicit reconnect is available if
+              needed. A real different signed-in identity requires confirmation; old views clear
+              first.
             </p>
             {button('Retry existing session renewal', restoreSession)}
-            {button('Connect this browser', connectBrowser)}
+            {isSignedIn && button('Connect this browser', connectBrowser)}
           </section>
         ) : (
           <>
@@ -426,132 +504,301 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
               </button>
               {button('Sign out', () => logout())}
             </div>
-            {(tab === 'Vault' || locked) && (
+            {(tab === 'Vault' || locked) && client.vault && isStandardVault(client.vault.vault) && (
               <section>
-                <h2>{client.vault ? 'Unlock your vault' : 'Vault setup / unlock'}</h2>
+                <h2>Standard encryption</h2>
                 <p>
-                  Passphrases never leave this device. Remembering a key grants indefinite access on
-                  this device until you lock or disconnect.
+                  Your encrypted data key is recoverable by this service after sign-in. No separate
+                  vault password is needed. Private mode removes the active server key wrap; it
+                  cannot erase prior backups or cached keys.
                 </p>
-                <label>
-                  {recovery ? 'Recovery secret' : 'Passphrase'}
-                  <input
-                    type="password"
-                    autoComplete="off"
-                    value={credential}
-                    onChange={(e) => setCredential(e.target.value)}
-                  />
-                </label>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={recovery}
-                    onChange={(e) => setRecovery(e.target.checked)}
-                  />
-                  Use recovery secret
-                </label>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={remember}
-                    onChange={(e) => setRemember(e.target.checked)}
-                  />
-                  Remember vault key on this device (no expiry)
-                </label>
-                {button('Unlock existing vault', async () => {
-                  const secret = credential;
-                  setCredential('');
-                  await client.unlock(secret, recovery, remember);
-                  await loadData();
-                })}
-                {!client.vault && (
+                {locked &&
+                  button('Unlock Standard vault', async () => {
+                    await client.loadVault();
+                    await client.unlockStandard();
+                    await loadData();
+                  })}
+                {!locked && (
                   <>
-                    {button('Prepare new vault', async () => {
-                      if (credential.length < 12)
-                        throw new Error('Use a passphrase of at least 12 characters');
-                      const secret = credential;
-                      setCredential('');
-                      setPrepared(await client.prepareVault(secret));
+                    <label>
+                      Private-mode passphrase
+                      <input
+                        type="password"
+                        autoComplete="new-password"
+                        value={newPassphrase}
+                        onChange={(event) => setNewPassphrase(event.target.value)}
+                      />
+                    </label>
+                    {button('Prepare Private key file', async () => {
+                      setPrivatePrepared(await client.preparePrivate(newPassphrase));
+                      setNewPassphrase('');
                       setDownloaded(false);
                       setAck(false);
                     })}
-                    {prepared && (
+                    <label>
+                      Or reuse an account-bound Private key file
+                      <input
+                        type="file"
+                        accept="application/json"
+                        disabled={busy || newPassphrase.length < 12}
+                        onChange={(event) => {
+                          const file = event.target.files?.[0];
+                          event.target.value = '';
+                          if (file)
+                            void run(async () => {
+                              if (file.size > 8192) throw new Error('Key file limit is 8 KiB');
+                              const epoch = client.lockEpoch,
+                                input: unknown = JSON.parse(await file.text());
+                              if (epoch !== client.lockEpoch) return;
+                              setPrivatePrepared(await client.preparePrivate(newPassphrase, input));
+                              setNewPassphrase('');
+                              setDownloaded(false);
+                              setAck(false);
+                            });
+                        }}
+                      />
+                    </label>
+                    {privatePrepared && (
                       <div className="warning">
-                        <h3>Save your recovery material before continuing</h3>
                         <p>
-                          If you lose your passphrase and recovery secret, your data cannot be
-                          recovered. The recovery file unlocks your finances: store it offline,
-                          never share it.
+                          Store this key file offline. Anyone with the file can decrypt your
+                          finances. Losing both it and your passphrase is unrecoverable.
                         </p>
                         <button
                           onClick={() => {
-                            if (
-                              prepared.accountId !== client.me?.accountId ||
-                              prepared.epoch !== client.lockEpoch
-                            ) {
-                              setPrepared(undefined);
-                              setError(
-                                'Prepared recovery material belongs to a previous account or lock epoch',
-                              );
-                              return;
-                            }
-                            download('finance-recovery.json', {
-                              version: 1,
-                              accountId: prepared.accountId,
-                              recoverySecret: prepared.recoverySecret,
-                            });
+                            download('finance-private-key.json', privatePrepared.keyFile);
                             setDownloaded(true);
                           }}
                         >
-                          Download recovery file
+                          Download Private key file
                         </button>
-                        <label className="check">
+                        <label>
                           <input
                             type="checkbox"
                             checked={ack}
-                            onChange={(e) => setAck(e.target.checked)}
+                            onChange={(event) => setAck(event.target.checked)}
                           />
-                          I saved the recovery file securely.
+                          I saved my key file securely.
                         </label>
                         <button
                           disabled={busy || !downloaded || !ack}
-                          onClick={() =>
-                            void run(async () => {
-                              await client.finishVault(prepared);
-                              setPrepared(undefined);
-                              await loadData();
-                            })
-                          }
+                          onClick={() => setModeAction('private')}
                         >
-                          Finish vault creation
+                          Verify & enable Private mode
                         </button>
                       </div>
                     )}
                   </>
                 )}
-                {!locked && (
-                  <>
-                    <label>
-                      New passphrase
-                      <input
-                        type="password"
-                        autoComplete="new-password"
-                        value={newPassphrase}
-                        onChange={(e) => setNewPassphrase(e.target.value)}
-                      />
-                    </label>
-                    {button('Change passphrase (same vault key)', async () => {
-                      if (newPassphrase.length < 12) throw new Error('Use at least 12 characters');
-                      const old = credential,
-                        next = newPassphrase;
-                      setCredential('');
-                      setNewPassphrase('');
-                      await client.rewrap(old, next, recovery);
-                      setNotice('Passphrase changed. Existing encrypted documents are unchanged.');
-                    })}
-                  </>
-                )}
               </section>
+            )}
+            {(tab === 'Vault' || locked) &&
+              (!client.vault || !isStandardVault(client.vault.vault)) && (
+                <section>
+                  <h2>{client.vault ? 'Unlock your vault' : 'Vault setup / unlock'}</h2>
+                  <p>
+                    Private mode: bring your key file on each new device, or use your existing
+                    passphrase/recovery secret. The service cannot recover this key.
+                  </p>
+                  <label>
+                    Import Private key / legacy recovery file
+                    <input
+                      type="file"
+                      accept="application/json"
+                      disabled={busy}
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        event.target.value = '';
+                        if (file)
+                          void run(async () => {
+                            if (file.size > 8192) throw new Error('Key file limit is 8 KiB');
+                            const epoch = client.lockEpoch,
+                              value: unknown = JSON.parse(await file.text());
+                            if (epoch !== client.lockEpoch) return;
+                            await client.unlockKeyFile(value, remember);
+                            await loadData();
+                          });
+                      }}
+                    />
+                  </label>
+                  <p>
+                    Passphrases never leave this device. Remembering a key grants indefinite access
+                    on this device until you lock or disconnect.
+                  </p>
+                  <label>
+                    {recovery ? 'Recovery secret' : 'Passphrase'}
+                    <input
+                      type="password"
+                      autoComplete="off"
+                      value={credential}
+                      onChange={(e) => setCredential(e.target.value)}
+                    />
+                  </label>
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={recovery}
+                      onChange={(e) => setRecovery(e.target.checked)}
+                    />
+                    Use recovery secret
+                  </label>
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={remember}
+                      onChange={(e) => setRemember(e.target.checked)}
+                    />
+                    Remember vault key on this device (no expiry)
+                  </label>
+                  {button(
+                    'Unlock existing vault',
+                    async () => {
+                      const secret = credential;
+                      setCredential('');
+                      await client.unlock(secret, recovery, remember);
+                      await loadData();
+                    },
+                    false,
+                    !!credential,
+                  )}
+                  {!client.vault && (
+                    <>
+                      {button('Prepare new vault', async () => {
+                        if (credential.length < 12)
+                          throw new Error('Use a passphrase of at least 12 characters');
+                        const secret = credential;
+                        setCredential('');
+                        setPrepared(await client.prepareVault(secret));
+                        setDownloaded(false);
+                        setAck(false);
+                      })}
+                      {prepared && (
+                        <div className="warning">
+                          <h3>Save your recovery material before continuing</h3>
+                          <p>
+                            If you lose your passphrase and recovery secret, your data cannot be
+                            recovered. The recovery file unlocks your finances: store it offline,
+                            never share it.
+                          </p>
+                          <button
+                            onClick={() => {
+                              if (
+                                prepared.accountId !== client.me?.accountId ||
+                                prepared.epoch !== client.lockEpoch
+                              ) {
+                                setPrepared(undefined);
+                                setError(
+                                  'Prepared recovery material belongs to a previous account or lock epoch',
+                                );
+                                return;
+                              }
+                              download('finance-recovery.json', {
+                                version: 1,
+                                accountId: prepared.accountId,
+                                recoverySecret: prepared.recoverySecret,
+                              });
+                              setDownloaded(true);
+                            }}
+                          >
+                            Download recovery file
+                          </button>
+                          <label className="check">
+                            <input
+                              type="checkbox"
+                              checked={ack}
+                              onChange={(e) => setAck(e.target.checked)}
+                            />
+                            I saved the recovery file securely.
+                          </label>
+                          <button
+                            disabled={busy || !downloaded || !ack}
+                            onClick={() =>
+                              void run(async () => {
+                                await client.finishVault(prepared);
+                                setPrepared(undefined);
+                                await loadData();
+                              })
+                            }
+                          >
+                            Finish vault creation
+                          </button>
+                        </div>
+                      )}
+                    </>
+                  )}
+                  {!locked && (
+                    <>
+                      <label>
+                        New passphrase
+                        <input
+                          type="password"
+                          autoComplete="new-password"
+                          value={newPassphrase}
+                          onChange={(e) => setNewPassphrase(e.target.value)}
+                        />
+                      </label>
+                      {button('Change passphrase (same vault key)', async () => {
+                        if (newPassphrase.length < 12)
+                          throw new Error('Use at least 12 characters');
+                        const old = credential,
+                          next = newPassphrase;
+                        setCredential('');
+                        setNewPassphrase('');
+                        await client.rewrap(old, next, recovery);
+                        setNotice(
+                          'Passphrase changed. Existing encrypted documents are unchanged.',
+                        );
+                      })}
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={trustServer}
+                          onChange={(event) => setTrustServer(event.target.checked)}
+                        />
+                        I trust this service to recover my encryption key after sign-in (Standard
+                        mode).
+                      </label>
+                      <button
+                        disabled={busy || !trustServer || !credential}
+                        onClick={() => setModeAction('standard')}
+                      >
+                        Verify & enable Standard mode
+                      </button>
+                    </>
+                  )}
+                </section>
+              )}
+            {modeAction && (
+              <StepUp
+                session={session}
+                onCancel={() => setModeAction(undefined)}
+                onVerified={async (assertCurrent) => {
+                  const action = modeAction,
+                    prepared = privatePrepared,
+                    secret = credential,
+                    epoch = client.lockEpoch;
+                  const token = await freshClerkToken();
+                  assertCurrent();
+                  if (epoch !== client.lockEpoch) throw new Error('Mode change cancelled by lock');
+                  if (action === 'private') {
+                    if (!prepared || !downloaded || !ack)
+                      throw new Error('Save and confirm your key file first');
+                    await client.finishPrivate(prepared, token, assertCurrent);
+                  } else
+                    await client.enableStandard(
+                      secret,
+                      recovery,
+                      token,
+                      trustServer,
+                      assertCurrent,
+                    );
+                  setCredential('');
+                  setModeAction(undefined);
+                  setPrivatePrepared(undefined);
+                  setLocked(true);
+                  setNotice('Encryption mode changed. Unlock deliberately to continue.');
+                }}
+              />
             )}
             {!locked && tab === 'Overview' && (
               <section>
@@ -763,13 +1010,18 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
                     }}
                   />
                 </label>
-                {button('Inspect requested access', async () => {
-                  const epoch = client.lockEpoch,
-                    result = await client.request<{
-                      client: { name: string; namespaces: string[]; products: string[] };
-                    }>('/pairing/inspect', 'POST', { pairingId: pairId, code });
-                  if (epoch === client.lockEpoch) setPair(result);
-                })}
+                {button(
+                  'Inspect requested access',
+                  async () => {
+                    const epoch = client.lockEpoch,
+                      result = await client.request<{
+                        client: { name: string; namespaces: string[]; products: string[] };
+                      }>('/pairing/inspect', 'POST', { pairingId: pairId, code });
+                    if (epoch === client.lockEpoch) setPair(result);
+                  },
+                  false,
+                  !!pairId && /^[0-9]{8}$/.test(code),
+                )}
                 {pair && (
                   <div className="warning">
                     <h3>{pair.client.name}</h3>
@@ -802,7 +1054,10 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
                     <p>
                       {session.client.namespaces.join(', ')} · Last active {session.lastUsedAt}
                     </p>
-                    <small>Absolute expiry {session.absoluteExpiresAt}</small>
+                    <small>
+                      Idle expiry {session.idleExpiresAt} · Absolute expiry{' '}
+                      {session.absoluteExpiresAt}
+                    </small>
                     {button(
                       'Revoke session',
                       async () => {
@@ -820,12 +1075,7 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
                 {button(
                   'Revoke all sessions',
                   async () => {
-                    try {
-                      await client.disconnect(true);
-                    } finally {
-                      setReady(false);
-                      await clerk.signOut();
-                    }
+                    await logout(true);
                   },
                   true,
                 )}
@@ -834,9 +1084,16 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
             {tab === 'Export & account' && (
               <section>
                 <h2>Data portability</h2>
-                {button('Download encrypted backup', async () =>
-                  download('finance-encrypted.json', await client.encryptedExport()),
-                )}
+                {button('Download encrypted backup', async () => {
+                  const passphrase =
+                    client.vault && isStandardVault(client.vault.vault)
+                      ? prompt(
+                          'Set a backup-only passphrase (at least 12 characters). Keep it separately; this backup cannot use server recovery.',
+                        )
+                      : undefined;
+                  if (passphrase === null) return;
+                  download('finance-encrypted.json', await client.encryptedExport(passphrase));
+                })}
                 {!locked &&
                   button('Download decrypted data (sensitive)', async () => {
                     if (!confirm('This file contains plaintext financial data. Save it securely?'))
@@ -869,7 +1126,7 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
                 <input
                   type="file"
                   accept="application/json"
-                  disabled={busy}
+                  disabled={busy || !restoreCredential}
                   onChange={(e) => {
                     const file = e.target.files?.[0];
                     e.target.value = '';
@@ -1122,7 +1379,9 @@ export function App({ client, storage }: { client: FinanceClient; storage: Stora
           </>
         )}
       </main>
-      <footer>End-to-end encrypted · No financial values are sent in plaintext to Finance.</footer>
+      <footer>
+        Encrypted financial storage · Standard: server-recoverable key · Private: bring your own key
+      </footer>
     </div>
   );
 }

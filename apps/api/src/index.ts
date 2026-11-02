@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { sessions } from './sessions';
 import { documents } from './documents';
+import { vaults } from './vaults';
 import { cleanup, lifecycle } from './lifecycle';
 import { ApiFailure } from './security';
 import type { Bindings } from './security';
@@ -38,6 +39,7 @@ app.get('/api/v1/config', (c) =>
 app.get('/api/v1/health', (c) => c.json({ ok: true }));
 app.route('/api/v1', sessions);
 app.route('/api/v1', documents);
+app.route('/api/v1', vaults);
 app.route('/api/v1', lifecycle);
 app.all('/api/*', (c) =>
   c.json(

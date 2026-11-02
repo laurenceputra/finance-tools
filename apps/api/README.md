@@ -21,7 +21,9 @@ from the root Wrangler configuration, not handwritten.
    local user data and obtain separate authorization before any destructive step.
 3. Set production runtime secrets shown in `.dev.vars.example` through the Worker
    dashboard (or nonsecret vars where appropriate). JWT and wrapping secrets are
-   **independent random base64url 32-byte keys**. Never reuse Clerk keys.
+   **independent random base64url 32-byte keys**. Never reuse Clerk keys. New
+   `VAULT_WRAP_SECRET` is required for Standard recovery; it must not reuse
+   `SESSION_WRAP_SECRET`. It has not been provisioned by this source change.
 4. Configure Clerk's session JWT audience to `CLERK_AUDIENCE`, set the exact
    `CLERK_ISSUER`, and configure its signed `user.deleted` webhook at
    `/api/v1/webhooks/clerk`. `CLERK_JWT_KEY` optionally supplies a PEM public key
@@ -74,6 +76,19 @@ The server cannot infer the intended AAD account from ciphertext alone; the
 regression verifies the client's principal-change guard before deployment.
 
 ## Routes and deliberate contract extensions/restrictions
+
+New verified exchanges initialize only null vaults as Standard; existing legacy
+vaults remain Private. `/vault/key` releases the committed Standard key to active
+browser or paired scoped script sessions after revision/mode/epoch rechecks.
+The purpose/version/account/key-version-bound AES-GCM server wrap is stored
+separately, never in public vault JSON, exports or receipts. `/vault/mode` requires
+fresh matching Clerk factors, browser authorization and atomic revision CAS;
+retries have metadata-only payload-bound receipts. Conversion keeps keyVersion.
+Private→Standard sends a transient authenticated client key with explicit trust
+consent; Standard→Private clears the active server wrap. Client wrapper continuity
+is verified by the supported flow, not guaranteed against malicious self-corruption.
+Mode changes cannot retroactively erase old backups/cached keys. Standard portable
+exports require a client-side passphrase wrapper. See [security](../../docs/SECURITY.md).
 
 All documented routes are implemented. Errors are structured and responses are
 `no-store`. Mutations accept strictly validated, bounded JSON. Reads of removed
@@ -165,7 +180,9 @@ token arrives in a JSON body (not the request's bearer/cookie). Signature,
 audience, authorized party, expiry and issuer are checked. Own access JWTs use
 `jose` with HS256 only, fixed issuer `https://finance.example.com`, fixed
 audience `finance-tools-api-v1`, 15-minute TTL and per-request active D1 checks.
-Refresh idle expiry is 90 days; absolute expiry is fixed at 365 days.
+Refresh idle expiry is 30 days; absolute expiry is fixed at 90 days. Migration
+`0002_vault_modes.sql` caps existing sessions from original millisecond timestamps
+without extending them. Cookie lifetime cannot exceed the remaining absolute TTL.
 Signed Clerk session `sts` must be absent (standard active session JWT) or exactly
 `active`; `pending`, null and all unknown explicit statuses are rejected for
 exchange and deletion. Both operations read Clerk Backend User `banned` and
@@ -211,10 +228,9 @@ AAD tuple does not include product; product classification is enforced by D1.
 
 The current envelope has no explicit AAD field. The server checks canonical
 base64url, nonce/ciphertext bounds, schema and current keyVersion, derives tenant
-and document context from auth/path and never accepts client account IDs. Only
-client AES-GCM decryption can verify that the authentication tag actually binds
-the canonical AAD tuple. The server cannot verify ciphertext authenticity or
-financial content and must not claim it can.
+and document context from auth/path and never accepts client account IDs. The
+document write path does not decrypt or verify authentication tags or financial
+content, even though Standard mode allows the service to recover the data key.
 
 No bodies, bearer/refresh/pairing credentials, codes, financial plaintext, raw
 SDK errors or full URLs are logged by application code. Configure platform logs
