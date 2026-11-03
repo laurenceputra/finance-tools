@@ -888,7 +888,7 @@ describe('real D1 API security', () => {
     await cleanup(env);
     expect((await env.DB.prepare('SELECT key FROM blobs').all()).results).toHaveLength(0);
   });
-  it('rejects account deletion with mismatched Clerk subject and drains more than 100 tombstones fairly', async () => {
+  it('rejects account deletion with a mismatched Clerk subject', async () => {
     expect(
       (
         await request('/account', 'DELETE', {
@@ -897,26 +897,102 @@ describe('real D1 API security', () => {
         })
       ).status,
     ).toBe(403);
+  });
+  it('advances the durable cleanup cursor beyond 100 accounts and wraps around', async () => {
     const statements = [];
     for (let i = 0; i < 105; i++) {
+      const id = `dead_${String(i).padStart(3, '0')}`;
       statements.push(
         env.DB.prepare(
           'INSERT INTO accounts(id,subject,created_at,deleted_at,cleanup_pending) VALUES(?,?,1,1,1)',
-        ).bind(`dead_${i}`, `deleted_user_${i}`),
+        ).bind(id, `deleted_user_${i}`),
       );
       statements.push(
         env.DB.prepare(
           "INSERT INTO documents(account_id,namespace,product,id,revision,updated_at) VALUES(?,'settings','portfolio','tombstone',1,'2026-01-01T00:00:00.000Z')",
-        ).bind(`dead_${i}`),
+        ).bind(id),
       );
     }
     for (let i = 0; i < statements.length; i += 80) await env.DB.batch(statements.slice(i, i + 80));
-    for (let i = 0; i < 105; i++) await cleanup(env);
+    await env.DB.prepare(
+      "INSERT INTO cleanup_state(id,cursor) VALUES('accounts','dead_103')",
+    ).run();
+    for (const [id, remaining] of [
+      ['dead_104', 104],
+      ['dead_000', 103],
+    ] as const) {
+      await cleanup(env);
+      expect(
+        await env.DB.prepare("SELECT cursor FROM cleanup_state WHERE id='accounts'").first(),
+      ).toEqual({ cursor: id });
+      expect(
+        await env.DB.prepare('SELECT id FROM documents WHERE account_id=?').bind(id).first(),
+      ).toBeNull();
+      expect(
+        await env.DB.prepare('SELECT deleted_at,cleanup_pending FROM accounts WHERE id=?')
+          .bind(id)
+          .first(),
+      ).toEqual({ deleted_at: 1, cleanup_pending: 0 });
+      expect(
+        (await env.DB.prepare("SELECT id FROM documents WHERE account_id LIKE 'dead_%'").all())
+          .results,
+      ).toHaveLength(remaining);
+    }
     expect(
-      (await env.DB.prepare("SELECT * FROM documents WHERE account_id LIKE 'dead_%'").all())
+      (
+        await env.DB.prepare(
+          "SELECT id FROM accounts WHERE id LIKE 'dead_%' AND deleted_at=1",
+        ).all()
+      ).results,
+    ).toHaveLength(105);
+  });
+  it('cleans the next account while the first still has a payload backlog', async () => {
+    const statements = ['dead_000', 'dead_001'].flatMap((id) => [
+      env.DB.prepare(
+        'INSERT INTO accounts(id,subject,created_at,deleted_at,cleanup_pending) VALUES(?,?,1,1,1)',
+      ).bind(id, `deleted_${id}`),
+      env.DB.prepare(
+        "INSERT INTO documents(account_id,namespace,product,id,revision,updated_at) VALUES(?,'settings','portfolio','tombstone',1,'2026-01-01T00:00:00.000Z')",
+      ).bind(id),
+    ]);
+    statements.push(
+      ...Array.from({ length: 17 }, (_, i) =>
+        env.DB.prepare(
+          "INSERT INTO blobs(key,account_id,bytes,created_at,envelope) VALUES(?,'dead_000',10,0,?)",
+        ).bind(`abandoned_${i}`, JSON.stringify(encrypted)),
+      ),
+    );
+    await env.DB.batch(statements);
+    await cleanup(env);
+    expect(
+      (await env.DB.prepare("SELECT key FROM blobs WHERE account_id='dead_000'").all()).results,
+    ).toHaveLength(1);
+    expect(
+      await env.DB.prepare("SELECT cleanup_pending FROM accounts WHERE id='dead_000'").first(),
+    ).toEqual({ cleanup_pending: 1 });
+    await cleanup(env);
+    expect(
+      await env.DB.prepare("SELECT cursor FROM cleanup_state WHERE id='accounts'").first(),
+    ).toEqual({ cursor: 'dead_001' });
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT id,deleted_at,cleanup_pending FROM accounts WHERE id LIKE 'dead_%' ORDER BY id",
+        ).all()
+      ).results,
+    ).toEqual([
+      { id: 'dead_000', deleted_at: 1, cleanup_pending: 1 },
+      { id: 'dead_001', deleted_at: 1, cleanup_pending: 0 },
+    ]);
+    expect(
+      (await env.DB.prepare("SELECT id FROM documents WHERE account_id LIKE 'dead_%'").all())
         .results,
     ).toHaveLength(0);
-  }, 30000);
+    await cleanup(env);
+    expect(
+      await env.DB.prepare("SELECT cleanup_pending FROM accounts WHERE id='dead_000'").first(),
+    ).toEqual({ cleanup_pending: 0 });
+  });
   it('exports beyond one metadata page without duplication or omission', async () => {
     expect((await put('base')).status).toBe(200);
     const row = await env.DB.prepare("SELECT blob_key FROM documents WHERE id='base'").first<{
@@ -970,24 +1046,30 @@ describe('real D1 API security', () => {
       envelope: encrypted,
     };
     expect((await request('/documents/settings/a', 'PUT', input)).status).toBe(200);
-    await env.DB.prepare(
-      "INSERT INTO blobs(key,account_id,bytes,created_at,envelope) VALUES('corrupt','account_a',10,0,'{}')",
-    ).run();
     await env.DB.batch([
-      env.DB.prepare("UPDATE documents SET blob_key='corrupt' WHERE id='a'"),
-      env.DB.prepare("UPDATE mutations SET blob_key='corrupt' WHERE document_id='a'"),
+      env.DB.prepare(
+        "INSERT INTO blobs(key,account_id,bytes,created_at,envelope) VALUES('corrupt','account_a',10,0,'{}')",
+      ),
+      env.DB.prepare(
+        "UPDATE documents SET blob_key='corrupt' WHERE account_id='account_a' AND namespace='settings' AND id='a'",
+      ),
+      env.DB.prepare(
+        "UPDATE mutations SET blob_key='corrupt' WHERE account_id='account_a' AND namespace='settings' AND document_id='a'",
+      ),
     ]);
     for (const path of ['/documents/settings/a', '/documents/settings', '/export'])
       expect((await request(path)).status).toBe(500);
     expect((await request('/documents/settings/a', 'PUT', input)).status).toBe(500);
-    await env.DB.prepare(
-      "INSERT INTO blobs(key,account_id,bytes,created_at,envelope) VALUES('foreign','account_b',10,0,?)",
-    )
-      .bind(JSON.stringify(encrypted))
-      .run();
     await env.DB.batch([
-      env.DB.prepare("UPDATE documents SET blob_key='foreign' WHERE id='a'"),
-      env.DB.prepare("UPDATE mutations SET blob_key='foreign' WHERE document_id='a'"),
+      env.DB.prepare(
+        "INSERT INTO blobs(key,account_id,bytes,created_at,envelope) VALUES('foreign','account_b',10,0,?)",
+      ).bind(JSON.stringify(encrypted)),
+      env.DB.prepare(
+        "UPDATE documents SET blob_key='foreign' WHERE account_id='account_a' AND namespace='settings' AND id='a'",
+      ),
+      env.DB.prepare(
+        "UPDATE mutations SET blob_key='foreign' WHERE account_id='account_a' AND namespace='settings' AND document_id='a'",
+      ),
     ]);
     for (const path of ['/documents/settings/a', '/documents/settings', '/export'])
       expect((await request(path)).status).toBe(500);
