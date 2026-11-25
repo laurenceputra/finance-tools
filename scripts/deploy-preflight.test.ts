@@ -74,6 +74,7 @@ it('generates private root-relative configuration without custom authentication 
   const output = join(result.root, 'wrangler.deploy.jsonc');
   expect(statSync(output).mode & 0o777).toBe(0o600);
   const config = JSON.parse(readFileSync(output, 'utf8'));
+  expect(config.keep_vars).toBe(true);
   expect(config.d1_databases[0].database_id).toBe('11111111-1111-4111-8111-111111111111');
   expect(config.routes).toEqual([{ pattern: 'finance.example.com', custom_domain: true }]);
   expect(config.vars.APP_ORIGIN).toBe('https://finance.example.com');
